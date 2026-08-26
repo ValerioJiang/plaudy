@@ -63,10 +63,17 @@ Same `align`, same report, both engines called through their production function
 |---|---|---|---|
 | row 57, 35.1 min | — | 12 speakers · 343 s | **3 speakers** · 36 s |
 | row 63, 9.3 min | 2 | 4 speakers · 86 s | 3 speakers · 9.8 s |
-| 3-host podcast, 55.5 min | 3 | see bench | **3 real** (41/36/23%) + one 6.6 s crumb · 56 s |
-| All-In podcast, 90.9 min | 4 | see bench | **exactly 4** (32/24/23/21%) · 92 s |
+| 3-host podcast, 55.5 min | 3 | **36 speakers** · 583 s | **3 real** (41/36/23%) + one 6.6 s crumb · 56 s |
+| All-In podcast, 90.9 min | 4 | **88 speakers** · 914 s | **exactly 4** (32/24/23/21%) · 92 s |
 
 Roughly **10× faster** as well: ~58× real time against sherpa's ~6×.
+
+The two podcasts are the clearest statement of the defect, and they were measured last: on audio
+whose true speaker count is 3 and 4, sherpa reports **36** and **88**. In both, everything past
+the first handful of speakers is a crumb — on the 3-host podcast, speakers #16 through #36 hold a
+few seconds each and round to 0 % of the talk time. This is the row-57 pathology unbounded by
+length, and it is why no threshold was ever going to be the fix: 88 clusters is not a calibration
+that drifted, it is an engine solving a different problem than the one asked of it.
 
 ### The price
 
