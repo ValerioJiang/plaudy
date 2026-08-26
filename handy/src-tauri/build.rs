@@ -12,6 +12,8 @@ fn main() {
 
     generate_tray_translations();
 
+    assert_diarization_model_staged();
+
     // Linux ships transcribe-cpp as a shared libtranscribe + loadable ggml
     // backend modules (the `dynamic-backends` posture in Cargo.toml). Bake an
     // $ORIGIN-relative rpath into the `handy` binary so it finds libtranscribe
@@ -585,4 +587,38 @@ fn is_command_line_tools_only() -> bool {
         .and_then(|out| String::from_utf8(out.stdout).ok())
         .map(|path| path.trim().ends_with("CommandLineTools"))
         .unwrap_or(false)
+}
+
+/// Fail a release build that would ship without the Sortformer checkpoint.
+///
+/// The 139 MB GGUF is fetched by `scripts/fetch-diarization-model.sh` rather than committed (it
+/// is over GitHub's per-file limit). That makes it easy to build an app that looks identical,
+/// installs fine, and quietly diarizes with the old sherpa engine — the exact regression this
+/// project just spent a session removing. A silent downgrade in a shipped binary is worse than a
+/// build that stops, so a release build stops.
+///
+/// Debug builds only warn: `cargo test` and `bun tauri dev` must keep working on a fresh clone,
+/// and there the fallback is visible in the logs. Set `PLAUDY_ALLOW_NO_SORTFORMER=1` to ship a
+/// deliberately Sortformer-less build.
+fn assert_diarization_model_staged() {
+    use std::path::Path;
+
+    println!("cargo:rerun-if-env-changed=PLAUDY_ALLOW_NO_SORTFORMER");
+    let model =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("resources/models/diarization/sortformer.gguf");
+    println!("cargo:rerun-if-changed={}", model.display());
+    if model.is_file() || std::env::var("PLAUDY_ALLOW_NO_SORTFORMER").is_ok() {
+        return;
+    }
+    let message = format!(
+        "diarization model missing: {}\n       \
+         run scripts/fetch-diarization-model.sh (139 MB, pinned + sha256-verified).\n       \
+         Without it the app falls back to the sherpa diarizer, which over-counts speakers.\n       \
+         Set PLAUDY_ALLOW_NO_SORTFORMER=1 to build without it on purpose.",
+        model.display()
+    );
+    if std::env::var("PROFILE").as_deref() == Ok("release") {
+        panic!("{message}");
+    }
+    println!("cargo:warning={message}");
 }
