@@ -11,7 +11,7 @@ Your Mac records the room, transcribes it, separates the speakers, and hands the
 ![macOS](https://img.shields.io/badge/macOS-14.4%2B-000000?logo=apple&logoColor=white)
 ![Built with](https://img.shields.io/badge/Rust%20%2B%20Tauri%202-24C8DB?logo=tauri&logoColor=white)
 ![On-device](https://img.shields.io/badge/100%25-on--device-4c1)
-![Tests](https://img.shields.io/badge/tests-216%20Rust%20%C2%B7%2014%20MCP-2ea44f)
+![Tests](https://img.shields.io/badge/tests-371%20Rust%20%C2%B7%2014%20MCP-2ea44f)
 ![License](https://img.shields.io/badge/license-MIT-blue)
 
 **[plaudy.vercel.app](https://plaudy.vercel.app)** · [Why](#why-plaudy) · [Features](#features) · [How it works](#how-it-works) · [Quick start](#quick-start) · [Plaudy vs alternatives](#plaudy-vs-the-alternatives) · [Privacy](#privacy-the-whole-point) · [Roadmap](#status--roadmap)
@@ -96,7 +96,7 @@ bun tauri build                           # … or build Plaudy.app + Plaudy_*.d
 - **First launch:** grant **Microphone** and **Audio Recording** permission (no Screen Recording needed — the Process Tap uses the audio-capture TCC permission, so there's no purple banner).
 - **Record a meeting:** click the menu-bar **ear** 👂, or run the app and hit the record hero. Watch it wake while recording. Stop, and the speaker-attributed transcript appears in **History**.
 - **Summarize with Claude:** the local MCP server is registered in [`.mcp.json`](.mcp.json) — point Claude / Claude Code at this repo and ask it to summarize or search your sessions.
-- **Tests:** `cd handy/src-tauri && cargo test --lib` → 216 passed · `cd handy/mcp && bun test` → 14 pass.
+- **Tests:** `cd handy/src-tauri && cargo test --lib` → 371 passed · `cd handy/mcp && bun test` → 14 pass.
 
 > The current `.dmg` is **ad-hoc signed** (build-from-source or right-click → Open on first launch). A Developer-ID-signed & notarized release is on the roadmap. Full build notes: [handy/BUILD.md](handy/BUILD.md).
 
