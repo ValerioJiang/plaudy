@@ -14,13 +14,12 @@ built on top of [Handy](https://github.com/cjpais/Handy) as scaffolding.
 - `README.md` — project landing page / index.
 - `docs/handy-architecture/` — forensic architecture docs of Handy + the Plaud gap analysis & roadmap.
 - `docs/RIFFADO-CODEWIKI.md` — teardown of the AGPL `riffado` app (a category peer); `docs/DECISIONS.md` — the Keep/Spec/Drop verdict distilled from it (what to adopt vs drop, with the AGPL clean-room boundary).
-- `.claude/ponytail/` — project-local Ponytail install (see its README). Not global.
 - `.nwave/` — nWave methodology config (used for backend/architecture work).
 - **Our code lives inside `handy/` (we extend the fork in place):** `handy/src-tauri/src/managers/session.rs` (long-form + dual-stream meeting sessions: `Track`/`mix_tracks`/`finalize_session`), `.../managers/diarization.rs` (`merge_segments`/`label_segments`), `.../audio_toolkit/audio/system_audio.rs` (CoreAudio system-audio tap), `.../audio_toolkit/audio/recorder.rs` (`with_chunk_sink` tap), `.../commands/session.rs`, `.../tray.rs` (the menu-bar ear 👂).
 - **`handy/mcp/`** — dependency-free local MCP server (Bun + `bun:sqlite`, read-only over `history.db`) that lets Claude summarize/search recordings; registered in repo-root `.mcp.json`.
 
 ## Conventions
-- **Ponytail is active in this folder** ("lazy senior dev": YAGNI → stdlib → native → one line → minimum). Toggle with `/ponytail lite|full|ultra|off`. Never cut validation, error handling, security, accessibility.
+- **pstack (poteto mode) is the working style here** (`pstack@cursor-plugins`, installed via the vendored `cursor/plugins` marketplace): go deep before going fast — understand → design → build → verify. Ponytail was removed from this workspace on 2026-08-26.
 - Use **nWave** waves/agents for backend & architectural work.
 - Prefer extending Handy's existing managers/pipeline over net-new subsystems where possible — cite the real `handy/src-tauri/...` file when proposing changes.
 

@@ -40,3 +40,6 @@ id_rsa*
 /handy/src-tauri/*.onnx
 .vercel
 .env*
+
+# ── Agent scratch (decision trails, run evidence) ──
+.atomic-cc/
