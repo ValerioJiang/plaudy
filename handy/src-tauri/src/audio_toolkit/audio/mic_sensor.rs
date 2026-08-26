@@ -14,7 +14,7 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use crate::audio_toolkit::audio::AudioRecorder;
+use crate::audio_toolkit::audio::{AudioRecorder, VadPolicy};
 use crate::audio_toolkit::vad::{SileroVad, VoiceActivityDetector};
 
 /// Stricter than dictation's 0.3: a *trigger* prefers missing a mumble over starting a session
@@ -45,7 +45,7 @@ impl MicVoiceSensor {
             .open(None)
             .map_err(|e| format!("mic sensor open: {e}"))?;
         recorder
-            .start()
+            .start(VadPolicy::Disabled)
             .map_err(|e| format!("mic sensor start: {e}"))?;
 
         let last_speech = Arc::new(Mutex::new(None::<Instant>));

@@ -1,0 +1,18 @@
+# Upstream paths the fork deliberately does not adopt. One glob per line, '#' comments.
+# adopt.sh filters both up-added.txt and theirs-only-modified.txt through this list.
+#
+# The self-update surface. It points at the cjpais/Handy release feed, so shipping
+# it in Plaudy would offer our users a Handy build. The tauri-plugin-updater
+# dependency was already removed from Cargo.toml for the same reason.
+src/components/whats-new/*
+src/components/settings/ShowWhatsNewOnUpdate.tsx
+src/components/settings/debug/WhatsNewPreview.tsx
+src/components/update-checker/UpdateChecker.tsx
+src/components/update-checker/portableInstaller.ts
+src/components/update-checker/portableInstaller.test.ts
+src/content/release-notes/*
+public/release-notes/*
+
+# Handy branding. The fork ships its own icon set, tray glyphs and wordmark.
+src-tauri/icons/*
+src-tauri/resources/handy*.png

@@ -1,0 +1,143 @@
+/* Plaudy Colors */
+
+:root {
+  /* Palette source of truth — Liquid Glass, brand palette shared with the
+     landing: ink #0a0a0a · paper #f6f5f2 · red #e8340c / red-ink #d42e0a ·
+     grey #62625e. One accent (red), no secondary brand hue. Each themed color
+     is defined once as a light/dark pair; the active tokens below and the
+     `data-theme` overrides reference these, so a hex lives in exactly one
+     place. */
+  --light-color-text: #0a0a0a;
+  --light-color-background: #f6f5f2;
+  --light-color-logo-primary: #d42e0a;
+  --light-color-logo-stroke: #7a1a05;
+  --light-color-accent: #d42e0a;
+  --light-color-background-ui: #d42e0a;
+  --light-color-surface: rgba(255, 255, 255, 0.55);
+  --light-color-mid-gray: #62625e;
+
+  --dark-color-text: #f6f5f2;
+  --dark-color-background: #131311;
+  --dark-color-logo-primary: #e8340c;
+  --dark-color-logo-stroke: #ff8d73;
+  --dark-color-accent: #e8340c;
+  --dark-color-background-ui: #e8340c;
+  --dark-color-surface: rgba(32, 32, 30, 0.5);
+  --dark-color-mid-gray: #8f8e8a;
+
+  /* Glass materials, the fork's own layer on top of the palette. Paired the
+     same way so an explicit theme override swaps the material too. */
+  --light-glass-surface: rgba(255, 255, 255, 0.42);
+  --light-glass-surface-strong: rgba(255, 255, 255, 0.65);
+  --light-glass-border: rgba(0, 0, 0, 0.08);
+  --light-glass-highlight: rgba(255, 255, 255, 0.6);
+  --light-glass-shadow: 0 8px 30px rgba(0, 0, 0, 0.08);
+  /* Translucent so the window vibrancy blurs through. */
+  --light-glass-body: color-mix(in srgb, #f6f5f2 52%, transparent);
+
+  --dark-glass-surface: rgba(30, 30, 34, 0.38);
+  --dark-glass-surface-strong: rgba(36, 36, 40, 0.62);
+  --dark-glass-border: rgba(255, 255, 255, 0.1);
+  --dark-glass-highlight: rgba(255, 255, 255, 0.08);
+  --dark-glass-shadow: 0 8px 30px rgba(0, 0, 0, 0.35);
+  --dark-glass-body: color-mix(in srgb, #131311 45%, transparent);
+
+  /* Semantic status colors. First used by SecureInputWarning; intended to
+     replace the ad-hoc yellow-500/red-500 usages (e.g. ui/Alert.tsx) over
+     time so status styling is themeable from one place. */
+  --light-color-warning: #d97706;
+  --light-color-error: #dc2626;
+  --dark-color-warning: #fbbf24;
+  --dark-color-error: #f87171;
+
+  /* Tokens that do not change between light and dark */
+  --color-text-stroke: #f6f6f6;
+
+  /* Active palette — defaults to light, follows the OS via the media query
+     below, or is forced by `data-theme` (see the overrides below). */
+  --color-text: var(--light-color-text);
+  --color-background: var(--light-color-background);
+  --color-logo-primary: var(--light-color-logo-primary);
+  --color-logo-stroke: var(--light-color-logo-stroke);
+  --color-accent: var(--light-color-accent);
+  --color-background-ui: var(--light-color-background-ui);
+  --color-surface: var(--light-color-surface);
+  --color-mid-gray: var(--light-color-mid-gray);
+  --color-warning: var(--light-color-warning);
+  --color-error: var(--light-color-error);
+  --glass-surface: var(--light-glass-surface);
+  --glass-surface-strong: var(--light-glass-surface-strong);
+  --glass-border: var(--light-glass-border);
+  --glass-highlight: var(--light-glass-highlight);
+  --glass-shadow: var(--light-glass-shadow);
+  --glass-body: var(--light-glass-body);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --color-text: var(--dark-color-text);
+    --color-background: var(--dark-color-background);
+    --color-logo-primary: var(--dark-color-logo-primary);
+    --color-logo-stroke: var(--dark-color-logo-stroke);
+    --color-accent: var(--dark-color-accent);
+    --color-background-ui: var(--dark-color-background-ui);
+    --color-surface: var(--dark-color-surface);
+    --color-mid-gray: var(--dark-color-mid-gray);
+    --color-warning: var(--dark-color-warning);
+    --color-error: var(--dark-color-error);
+    --glass-surface: var(--dark-glass-surface);
+    --glass-surface-strong: var(--dark-glass-surface-strong);
+    --glass-border: var(--dark-glass-border);
+    --glass-highlight: var(--dark-glass-highlight);
+    --glass-shadow: var(--dark-glass-shadow);
+    --glass-body: var(--dark-glass-body);
+  }
+}
+
+/*
+ * Explicit theme override, driven by the `theme` setting via
+ * `document.documentElement.dataset.theme`. When set, the higher-specificity
+ * attribute selectors win over the `prefers-color-scheme` media query above,
+ * so a user can keep Plaudy light or dark regardless of the OS setting.
+ * `system` (or no attribute) leaves the OS in charge.
+ *
+ * Lives here (not in App.css) so every window that imports the shared palette —
+ * the settings window and the recording overlay alike — honours the override.
+ */
+:root[data-theme="light"] {
+  --color-text: var(--light-color-text);
+  --color-background: var(--light-color-background);
+  --color-logo-primary: var(--light-color-logo-primary);
+  --color-logo-stroke: var(--light-color-logo-stroke);
+  --color-accent: var(--light-color-accent);
+  --color-background-ui: var(--light-color-background-ui);
+  --color-surface: var(--light-color-surface);
+  --color-mid-gray: var(--light-color-mid-gray);
+  --color-warning: var(--light-color-warning);
+  --color-error: var(--light-color-error);
+  --glass-surface: var(--light-glass-surface);
+  --glass-surface-strong: var(--light-glass-surface-strong);
+  --glass-border: var(--light-glass-border);
+  --glass-highlight: var(--light-glass-highlight);
+  --glass-shadow: var(--light-glass-shadow);
+  --glass-body: var(--light-glass-body);
+}
+
+:root[data-theme="dark"] {
+  --color-text: var(--dark-color-text);
+  --color-background: var(--dark-color-background);
+  --color-logo-primary: var(--dark-color-logo-primary);
+  --color-logo-stroke: var(--dark-color-logo-stroke);
+  --color-accent: var(--dark-color-accent);
+  --color-background-ui: var(--dark-color-background-ui);
+  --color-surface: var(--dark-color-surface);
+  --color-mid-gray: var(--dark-color-mid-gray);
+  --color-warning: var(--dark-color-warning);
+  --color-error: var(--dark-color-error);
+  --glass-surface: var(--dark-glass-surface);
+  --glass-surface-strong: var(--dark-glass-surface-strong);
+  --glass-border: var(--dark-glass-border);
+  --glass-highlight: var(--dark-glass-highlight);
+  --glass-shadow: var(--dark-glass-shadow);
+  --glass-body: var(--dark-glass-body);
+}

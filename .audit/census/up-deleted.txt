@@ -1,0 +1,2 @@
+src-tauri/src/managers/transcription_mock.rs
+tailwind.config.js

@@ -384,7 +384,10 @@ fn cap_speakers(turns: Vec<SpeakerTurn>, max_n: Option<usize>) -> Vec<SpeakerTur
     // Working set: speaker id -> its turns' (start,end); renumber at the end.
     let mut by_spk: HashMap<i64, Vec<(i64, i64)>> = HashMap::new();
     for t in &turns {
-        by_spk.entry(t.speaker).or_default().push((t.start_ms, t.end_ms));
+        by_spk
+            .entry(t.speaker)
+            .or_default()
+            .push((t.start_ms, t.end_ms));
     }
 
     // Min gap between two speakers' turn sets (0 if any pair overlaps) — the merge affinity.
@@ -1083,7 +1086,10 @@ mod tests {
 
         // 2) Re-diarize with the REAL windowed engine (calibratable via HANDY_DIAR_THRESHOLD).
         let diarizer = DiarizationManager::new(std::path::Path::new(&models));
-        assert!(diarizer.is_available(), "diarization models missing at {models}");
+        assert!(
+            diarizer.is_available(),
+            "diarization models missing at {models}"
+        );
         let turns = diarizer.diarize(&samples);
         assert!(!turns.is_empty(), "diarization produced no turns");
 
@@ -1186,13 +1192,14 @@ mod tests {
                 &format!(
                     "DELETE FROM speakers WHERE history_id = ? AND id NOT IN ({placeholders})"
                 ),
-                rusqlite::params_from_iter(
-                    std::iter::once(history_id).chain(kept.iter().copied()),
-                ),
+                rusqlite::params_from_iter(std::iter::once(history_id).chain(kept.iter().copied())),
             )
             .unwrap();
             tx.commit().unwrap();
-            eprintln!("[rediar] WROTE {} speakers to history_id {history_id}", dense.len());
+            eprintln!(
+                "[rediar] WROTE {} speakers to history_id {history_id}",
+                dense.len()
+            );
         } else {
             eprintln!("[rediar] read-only (set HANDY_REDIARIZE_WRITE=1 to persist)");
         }

@@ -25,7 +25,7 @@
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 use crate::audio_toolkit::audio::SystemAudioRecorder;
-use crate::audio_toolkit::AudioRecorder;
+use crate::audio_toolkit::{AudioRecorder, VadPolicy};
 use crate::managers::diarization::{
     align, drop_bleed, label_segments, merge_segments, AsrSegment, DiarizationManager, TimedSegment,
 };
@@ -829,7 +829,8 @@ fn build_recorder(source: Source, tx: mpsc::Sender<Vec<f32>>) -> Result<ActiveRe
                 .map_err(|e| anyhow!("create mic recorder: {e}"))?
                 .with_chunk_sink(tx);
             r.open(None).map_err(|e| anyhow!("open microphone: {e}"))?;
-            r.start().map_err(|e| anyhow!("start mic capture: {e}"))?;
+            r.start(VadPolicy::Disabled)
+                .map_err(|e| anyhow!("start mic capture: {e}"))?;
             Ok(ActiveRecorder::Mic(r))
         }
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -1980,16 +1981,27 @@ mod tests {
             &[1000; 8],
             0,
         )];
-        let tm =
-            StubTranscriber::with_script(vec![Ok(("hello".into(), vec![asr_seg(0, 500, "hello")]))]);
+        let tm = StubTranscriber::with_script(vec![Ok((
+            "hello".into(),
+            vec![asr_seg(0, 500, "hello")],
+        ))]);
         let sink = RecordingSink {
             row_deleted: true,
             ..Default::default()
         };
 
-        let r = persist_session(&tm, &sink, &no_model_diarizer(), &tracks, &dir.join("a.wav"));
+        let r = persist_session(
+            &tm,
+            &sink,
+            &no_model_diarizer(),
+            &tracks,
+            &dir.join("a.wav"),
+        );
 
-        assert!(r.is_ok(), "a row deleted mid-finalize must not surface as a failure");
+        assert!(
+            r.is_ok(),
+            "a row deleted mid-finalize must not surface as a failure"
+        );
         assert!(
             sink.segments.lock().unwrap().is_empty(),
             "must not write segments to a vanished row (FK constraint would fail)"

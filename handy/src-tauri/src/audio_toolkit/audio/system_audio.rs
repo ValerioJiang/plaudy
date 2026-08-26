@@ -16,7 +16,7 @@ use std::ffi::c_void;
 use std::ptr::NonNull;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    mpsc, Arc, Mutex,
+    mpsc, Arc,
 };
 
 use block2::RcBlock;
@@ -39,9 +39,7 @@ use objc2_core_audio_types::{
 use objc2_core_foundation::CFDictionary;
 use objc2_foundation::{NSArray, NSCopying, NSNumber, NSString, NSUUID};
 
-use crate::audio_toolkit::vad::{self, VoiceActivityDetector};
-
-use super::recorder::{run_consumer, AudioChunk, Cmd};
+use super::recorder::{run_consumer, AudioChunk, Cmd, FrameSinks, VadPolicy};
 
 const NO_ERR: i32 = 0;
 
@@ -63,7 +61,6 @@ type IoProcBlock = RcBlock<
 pub struct SystemAudioRecorder {
     cmd_tx: Option<mpsc::Sender<Cmd>>,
     worker_handle: Option<std::thread::JoinHandle<()>>,
-    vad: Option<Arc<Mutex<Box<dyn vad::VoiceActivityDetector>>>>,
     level_cb: Option<Arc<dyn Fn(Vec<f32>) + Send + Sync + 'static>>,
     chunk_sink: Option<mpsc::Sender<Vec<f32>>>,
 
@@ -79,7 +76,6 @@ impl SystemAudioRecorder {
         Ok(SystemAudioRecorder {
             cmd_tx: None,
             worker_handle: None,
-            vad: None,
             level_cb: None,
             chunk_sink: None,
             tap_id: 0,
@@ -87,11 +83,6 @@ impl SystemAudioRecorder {
             io_proc_id: None,
             stop_flag: Arc::new(AtomicBool::new(false)),
         })
-    }
-
-    pub fn with_vad(mut self, vad: Box<dyn VoiceActivityDetector>) -> Self {
-        self.vad = Some(Arc::new(Mutex::new(vad)));
-        self
     }
 
     pub fn with_level_callback<F>(mut self, cb: F) -> Self
@@ -182,18 +173,18 @@ impl SystemAudioRecorder {
         let stop_flag = Arc::new(AtomicBool::new(false));
         self.stop_flag = stop_flag.clone();
 
-        let vad = self.vad.clone();
         let level_cb = self.level_cb.clone();
         let chunk_sink = self.chunk_sink.clone();
 
         let worker = std::thread::spawn(move || {
             run_consumer(
                 in_sample_rate,
-                super::recorder::FrameSink::from_parts(chunk_sink, vad),
+                FrameSinks::new(None, None, chunk_sink),
                 sample_rx,
                 cmd_rx,
                 level_cb,
                 stop_flag,
+                std::time::Instant::now(),
             );
         });
 
@@ -292,7 +283,11 @@ impl SystemAudioRecorder {
 
     pub fn start(&self) -> Result<(), Box<dyn std::error::Error>> {
         if let Some(tx) = &self.cmd_tx {
-            tx.send(Cmd::Start)?;
+            tx.send(Cmd::Start(
+                VadPolicy::Disabled,
+                std::time::Instant::now(),
+                mpsc::channel().0,
+            ))?;
         }
         Ok(())
     }
