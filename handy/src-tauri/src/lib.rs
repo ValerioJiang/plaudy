@@ -1227,6 +1227,16 @@ pub fn run(cli_args: CliArgs) {
 
             initialize_core_logic(&app_handle);
 
+            // Secure Input monitor (macOS): detects stuck secure input that
+            // silently blocks keyed shortcuts, warns the user, and activates
+            // the Carbon fallback. See secure_input.rs and issue #1578.
+            secure_input::init(&app_handle);
+
+            // Ordering is load-bearing: `init` is what `manage`s SecureInputState, and the
+            // eager shortcut init below reaches `reconcile_fallback`, which `state()`s it.
+            // Upstream never hit this because it registers shortcuts from the frontend, long
+            // after setup; the fork's backend-side init runs inside setup, so managing the
+            // state first is the difference between launching and aborting on startup.
             // Enigo and the global shortcuts are normally initialized by the frontend after
             // onboarding (App.tsx). That is temporal coupling across processes: if the webview
             // never loads (hidden window plus a dev binary without vite, or any webview
@@ -1244,11 +1254,6 @@ pub fn run(cli_args: CliArgs) {
                     log::warn!("Startup shortcuts init failed: {}", e);
                 }
             }
-
-            // Secure Input monitor (macOS): detects stuck secure input that
-            // silently blocks keyed shortcuts, warns the user, and activates
-            // the Carbon fallback. See secure_input.rs and issue #1578.
-            secure_input::init(&app_handle);
 
             // Populate the overlay-enabled cache from initial settings so the
             // audio path (overlay::emit_levels, called ~24 Hz during recording)
