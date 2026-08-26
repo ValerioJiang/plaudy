@@ -1,4 +1,12 @@
-import React, { useState, useRef, useEffect, useCallback } from "react";
+import React, {
+  createContext,
+  useCallback,
+  useContext,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { Play, Pause } from "lucide-react";
 import { formatClock } from "@/utils/formatClock";
 import { commands } from "@/bindings";
@@ -9,10 +17,43 @@ interface AudioPlayerProps {
   className?: string;
 }
 
+interface AudioPlayerGroupContextValue {
+  requestPlayback: (audio: HTMLAudioElement) => void;
+  releasePlayback: (audio: HTMLAudioElement) => void;
+}
+
+const AudioPlayerGroupContext =
+  createContext<AudioPlayerGroupContextValue | null>(null);
+
+export const AudioPlayerGroup: React.FC<React.PropsWithChildren> = ({
+  children,
+}) => {
+  const activeAudioRef = useRef<HTMLAudioElement | null>(null);
+  const value = useMemo<AudioPlayerGroupContextValue>(
+    () => ({
+      requestPlayback: (audio) => {
+        if (activeAudioRef.current !== audio) activeAudioRef.current?.pause();
+        activeAudioRef.current = audio;
+      },
+      releasePlayback: (audio) => {
+        if (activeAudioRef.current === audio) activeAudioRef.current = null;
+      },
+    }),
+    [],
+  );
+
+  return (
+    <AudioPlayerGroupContext.Provider value={value}>
+      {children}
+    </AudioPlayerGroupContext.Provider>
+  );
+};
+
 export const AudioPlayer: React.FC<AudioPlayerProps> = ({
   onLoadRequest,
   className = "",
 }) => {
+  const group = useContext(AudioPlayerGroupContext);
   const [isPlaying, setIsPlaying] = useState(false);
   const [duration, setDuration] = useState(0);
   const [currentTime, setCurrentTime] = useState(0);
@@ -86,16 +127,19 @@ export const AudioPlayer: React.FC<AudioPlayerProps> = ({
     // Tell auto-capture we're the ones playing, so replay audio doesn't self-trigger a capture
     // (the WebView plays from a separate PID the sensor's own-PID filter can't recognize).
     const handleEnded = () => {
+      group?.releasePlayback(audio);
       setIsPlaying(false);
       setCurrentTime(audio.duration || 0);
       commands.setPlaybackActive(false).catch(console.error);
     };
 
     const handlePlay = () => {
+      group?.requestPlayback(audio);
       setIsPlaying(true);
       commands.setPlaybackActive(true).catch(console.error);
     };
     const handlePause = () => {
+      group?.releasePlayback(audio);
       setIsPlaying(false);
       commands.setPlaybackActive(false).catch(console.error);
     };
@@ -106,6 +150,7 @@ export const AudioPlayer: React.FC<AudioPlayerProps> = ({
     audio.addEventListener("pause", handlePause);
 
     return () => {
+      group?.releasePlayback(audio);
       audio.removeEventListener("loadedmetadata", handleLoadedMetadata);
       audio.removeEventListener("ended", handleEnded);
       audio.removeEventListener("play", handlePlay);
@@ -114,7 +159,7 @@ export const AudioPlayer: React.FC<AudioPlayerProps> = ({
       // auto-capture is never left suppressed forever.
       commands.setPlaybackActive(false).catch(console.error);
     };
-  }, []);
+  }, [group]);
 
   // Auto-play when the lazily requested src becomes available
   const prevLoadedSrc = useRef<string | null>(null);

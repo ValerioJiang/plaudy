@@ -173,9 +173,23 @@ pub fn drop_bleed(segments: Vec<TimedSegment>, mic_label: &str) -> Vec<TimedSegm
         .collect()
 }
 
-/// Local speaker diarizer (sherpa-onnx). Loads the pyannote segmentation + speaker-embedding
-/// ONNX models from `<models_dir>/diarization/` and runs an offline pass over a recording's
-/// 16 kHz mono samples, producing speaker turns to feed [`align`].
+/// Local speaker diarizer. Runs an offline pass over a recording's 16 kHz mono samples and
+/// produces the speaker turns that [`align`] attributes ASR text to.
+///
+/// Two engines live here, both reading from `<models_dir>/diarization/`:
+///
+///   * **Sortformer** (preferred): NVIDIA Streaming Sortformer 4spk v2.1 as a GGUF, run through
+///     transcribe-cpp's `sortformer` family. End-to-end neural — it emits speaker activity
+///     directly, so there is no embedding clustering to over-split and no window seam to lose a
+///     speaker across. Hard ceiling of 4 speakers, baked into the checkpoint.
+///   * **sherpa-onnx** (fallback): pyannote segmentation + TitaNet embeddings, agglomerative
+///     clustering, windowed above [`DIAR_WINDOW_THRESHOLD_SECS`]. No speaker ceiling, but it
+///     over-counts badly on real audio and cannot carry identity across window seams (sherpa's
+///     Rust API exposes no cluster vectors). Kept for recordings with more than four people.
+///
+/// Measured on real recordings (`diarizer_ab`), truth in brackets: a 35-min 3-voice meeting [3]
+/// gave sherpa 12 speakers in 343 s and sortformer 3 in 36 s; a 91-min 4-host podcast [4] gave
+/// sortformer exactly 4, split 32/24/23/21%. Sortformer is also ~10x faster.
 ///
 /// ponytail: safe-by-default. `diarize` no-ops (returns no turns) when the two model files are
 /// absent, so the app behaves exactly as before until the user provides them — and sherpa's
@@ -183,6 +197,8 @@ pub fn drop_bleed(segments: Vec<TimedSegment>, mic_label: &str) -> Vec<TimedSegm
 /// The sherpa engine is created per call and dropped immediately, keeping that window minimal.
 /// Model auto-download via `ModelManager` is the documented upgrade path (see HANDOFF §6/Phase D).
 pub struct DiarizationManager {
+    /// Sortformer GGUF; when present (and not vetoed by `HANDY_DIAR_ENGINE`) it is the engine.
+    sortformer_model: std::path::PathBuf,
     seg_model: std::path::PathBuf,
     emb_model: std::path::PathBuf,
     /// Window-boundary cancellation flag, checked between diarization windows (C2). Tripping it
@@ -204,21 +220,69 @@ impl DiarizationManager {
     pub const SUBDIR: &'static str = "diarization";
     pub const SEG_FILE: &'static str = "segmentation.onnx";
     pub const EMB_FILE: &'static str = "embedding.onnx";
+    /// The Sortformer checkpoint, bundled into the app by
+    /// `scripts/fetch-diarization-model.sh` (it is 139 MB, so it is fetched at build time
+    /// rather than committed) and installed on first run like the two ONNX files.
+    pub const SORTFORMER_FILE: &'static str = "sortformer.gguf";
 
     /// `models_dir` is the app-data models directory; diarization models live in its
     /// `diarization/` subfolder as `segmentation.onnx` + `embedding.onnx`.
     pub fn new(models_dir: &std::path::Path) -> Self {
         let dir = models_dir.join(Self::SUBDIR);
         Self {
+            sortformer_model: dir.join(Self::SORTFORMER_FILE),
             seg_model: dir.join(Self::SEG_FILE),
             emb_model: dir.join(Self::EMB_FILE),
             cancel: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
-    /// True when both model files are present (diarization can run).
+    /// True when SOME engine can run. Either model set on its own is enough, so an install that
+    /// only ever received the ONNX pair (every build before Sortformer shipped) keeps working.
     pub fn is_available(&self) -> bool {
+        self.sortformer_available() || self.sherpa_available()
+    }
+
+    fn sortformer_available(&self) -> bool {
+        self.sortformer_model.is_file()
+    }
+
+    fn sherpa_available(&self) -> bool {
         self.seg_model.is_file() && self.emb_model.is_file()
+    }
+
+    /// Which engine a `diarize` call will use. Sortformer wins when its checkpoint is present,
+    /// because on real audio it is both more accurate and ~10x faster; sherpa is the fallback
+    /// for an install without it, and the deliberate choice for a recording with more than four
+    /// speakers (`HANDY_DIAR_ENGINE=sherpa`).
+    fn engine(&self) -> DiarEngine {
+        match std::env::var("HANDY_DIAR_ENGINE").ok().as_deref() {
+            Some("sherpa") if self.sherpa_available() => DiarEngine::Sherpa,
+            Some("sortformer") if self.sortformer_available() => DiarEngine::Sortformer,
+            Some(other @ ("sherpa" | "sortformer")) => {
+                log::warn!(
+                    "diarization: HANDY_DIAR_ENGINE={other} requested but its model is missing; \
+                     falling back to whatever is installed"
+                );
+                self.installed_engine()
+            }
+            Some(other) => {
+                log::warn!(
+                    "diarization: unknown HANDY_DIAR_ENGINE={other:?} (expected \"sortformer\" \
+                     or \"sherpa\"); using the installed default"
+                );
+                self.installed_engine()
+            }
+            None => self.installed_engine(),
+        }
+    }
+
+    fn installed_engine(&self) -> DiarEngine {
+        if self.sortformer_available() {
+            DiarEngine::Sortformer
+        } else {
+            DiarEngine::Sherpa
+        }
     }
 
     /// Diarize 16 kHz mono `samples` into speaker turns (ms). Returns an empty Vec when the
@@ -233,10 +297,79 @@ impl DiarizationManager {
     /// path unchanged.
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     pub fn diarize(&self, samples: &[f32]) -> Vec<SpeakerTurn> {
+        if !self.is_available() {
+            return Vec::new();
+        }
+        match self.engine() {
+            DiarEngine::Sortformer => self.diarize_sortformer(samples),
+            DiarEngine::Sherpa => self.diarize_sherpa(samples),
+        }
+    }
+
+    /// Sortformer: one pass, no windowing, no clustering knobs. The model streams internally, so
+    /// it carries speaker identity across a whole recording by construction — which is exactly
+    /// the failure the sherpa path cannot fix (see [`stitch_windows`]).
+    ///
+    /// Returns no turns on any failure, so [`align`] degrades to "unknown speaker" rather than
+    /// the finalize failing: a recording with an unattributed transcript is still useful, a lost
+    /// recording is not.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn diarize_sortformer(&self, samples: &[f32]) -> Vec<SpeakerTurn> {
+        use transcribe_cpp::{
+            Diarize, Model, RunExtension, RunOptions, SortformerPreset, SortformerStreamOptions,
+        };
+
+        let model = match Model::load(&self.sortformer_model) {
+            Ok(m) => m,
+            Err(e) => {
+                log::warn!("diarization: failed to load sortformer model: {e}");
+                return self.diarize_sherpa(samples);
+            }
+        };
+        let mut session = match model.session() {
+            Ok(s) => s,
+            Err(e) => {
+                log::warn!("diarization: failed to open sortformer session: {e}");
+                return self.diarize_sherpa(samples);
+            }
+        };
+
+        // VeryHighLatency is the checkpoint's documented offline-file operating point (~30 s
+        // lookahead). We diarize a finished recording, so latency costs nothing and the widest
+        // lookahead is the most accurate point on the curve.
+        let options = RunOptions {
+            diarize: Diarize::On,
+            family: Some(RunExtension::Sortformer(SortformerStreamOptions {
+                preset: Some(SortformerPreset::VeryHighLatency),
+            })),
+            ..Default::default()
+        };
+        let started = std::time::Instant::now();
+        let transcript = match session.run(samples, &options) {
+            Ok(t) => t,
+            Err(e) => {
+                log::warn!("diarization: sortformer run failed: {e}");
+                return self.diarize_sherpa(samples);
+            }
+        };
+        let turns = sortformer_turns(&transcript.speaker_segments);
+        let speakers: std::collections::BTreeSet<i64> = turns.iter().map(|t| t.speaker).collect();
+        log::info!(
+            "diarization: sortformer found {} speaker(s) in {} turn(s) over {:.1} min ({:.1}s)",
+            speakers.len(),
+            turns.len(),
+            samples.len() as f64 / 16_000.0 / 60.0,
+            started.elapsed().as_secs_f64(),
+        );
+        turns
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn diarize_sherpa(&self, samples: &[f32]) -> Vec<SpeakerTurn> {
         use sherpa_onnx::{OfflineSpeakerDiarization, OfflineSpeakerDiarizationConfig};
         use std::sync::atomic::Ordering;
 
-        if !self.is_available() {
+        if !self.sherpa_available() {
             return Vec::new();
         }
         let mut config = OfflineSpeakerDiarizationConfig::default();
@@ -314,6 +447,37 @@ impl DiarizationManager {
     }
 }
 
+/// Which diarization engine a call resolves to. Not a user setting: the choice follows what is
+/// installed, with `HANDY_DIAR_ENGINE` as the escape hatch for a >4-speaker recording.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiarEngine {
+    Sortformer,
+    Sherpa,
+}
+
+/// Sortformer speaker segments → the fork's [`SpeakerTurn`]s.
+///
+/// Two things are normalised here, both of them documented properties of the C ABI rather than
+/// guesses: a segment whose times are both zero means "attributed but untimed", which `align`
+/// cannot use and which would otherwise land as a phantom turn at t=0; and `speaker_id` is
+/// 1-based, while the rest of this module treats speaker ids as opaque, so they are passed
+/// through unchanged and only their DISTINCTNESS matters.
+fn sortformer_turns(segments: &[transcribe_cpp::SpeakerSegment]) -> Vec<SpeakerTurn> {
+    let mut turns: Vec<SpeakerTurn> = segments
+        .iter()
+        .filter(|s| s.t1_ms > s.t0_ms)
+        .map(|s| SpeakerTurn {
+            start_ms: s.t0_ms,
+            end_ms: s.t1_ms,
+            speaker: s.speaker_id as i64,
+        })
+        .collect();
+    // `align` votes by overlap and does not require ordering, but every other consumer (and the
+    // History timeline) reads better chronologically, and sherpa's path already sorts.
+    turns.sort_by_key(|t| (t.start_ms, t.end_ms, t.speaker));
+    turns
+}
+
 /// Cosine-distance merge threshold for sherpa's agglomerative clustering: two embedding clusters
 /// closer than this fuse into one speaker. Higher → fewer, larger clusters. sherpa's default
 /// (0.5) over-splits on long/noisy real audio — an 89-min meeting of 4 people clustered to 104
@@ -384,7 +548,10 @@ fn cap_speakers(turns: Vec<SpeakerTurn>, max_n: Option<usize>) -> Vec<SpeakerTur
     // Working set: speaker id -> its turns' (start,end); renumber at the end.
     let mut by_spk: HashMap<i64, Vec<(i64, i64)>> = HashMap::new();
     for t in &turns {
-        by_spk.entry(t.speaker).or_default().push((t.start_ms, t.end_ms));
+        by_spk
+            .entry(t.speaker)
+            .or_default()
+            .push((t.start_ms, t.end_ms));
     }
 
     // Min gap between two speakers' turn sets (0 if any pair overlaps) — the merge affinity.
@@ -1040,6 +1207,216 @@ mod tests {
         assert_eq!(out.len(), 8, "no turns are dropped, only relabelled");
     }
 
+    fn spk_seg(t0_ms: i64, t1_ms: i64, speaker_id: i32) -> transcribe_cpp::SpeakerSegment {
+        transcribe_cpp::SpeakerSegment {
+            t0_ms,
+            t1_ms,
+            speaker_id,
+            p: f32::NAN,
+        }
+    }
+
+    #[test]
+    fn sortformer_segments_become_chronological_speaker_turns() {
+        let turns = sortformer_turns(&[
+            spk_seg(5_000, 9_000, 2),
+            spk_seg(0, 4_000, 1),
+            spk_seg(9_000, 12_000, 1),
+        ]);
+        assert_eq!(
+            turns,
+            vec![
+                SpeakerTurn {
+                    start_ms: 0,
+                    end_ms: 4_000,
+                    speaker: 1
+                },
+                SpeakerTurn {
+                    start_ms: 5_000,
+                    end_ms: 9_000,
+                    speaker: 2
+                },
+                SpeakerTurn {
+                    start_ms: 9_000,
+                    end_ms: 12_000,
+                    speaker: 1
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn sortformer_untimed_attribution_is_not_a_phantom_turn_at_zero() {
+        // The C ABI signals "attributed but no turn timing" with both timestamps zero. Kept as a
+        // turn it would sit at t=0 and win the overlap vote for the recording's opening words —
+        // attributing them to a speaker the model never actually placed there.
+        let turns = sortformer_turns(&[spk_seg(0, 0, 3), spk_seg(0, 2_000, 1)]);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].speaker, 1);
+    }
+
+    #[test]
+    fn sortformer_speaker_ids_stay_distinct_through_the_mapping() {
+        // Ids are 1-based upstream and opaque here; what must survive is how many there are and
+        // which turns share one, since that is all `align` and the History timeline use.
+        let turns = sortformer_turns(&[
+            spk_seg(0, 1_000, 1),
+            spk_seg(1_000, 2_000, 4),
+            spk_seg(2_000, 3_000, 1),
+        ]);
+        let distinct: std::collections::BTreeSet<i64> = turns.iter().map(|t| t.speaker).collect();
+        assert_eq!(distinct.len(), 2);
+        assert_eq!(turns[0].speaker, turns[2].speaker);
+    }
+
+    /// A manager whose model paths point at files we create (or don't) in a temp dir, so engine
+    /// selection can be tested without either runtime.
+    fn manager_with(sortformer: bool, sherpa: bool) -> (tempfile::TempDir, DiarizationManager) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let diar = dir.path().join(DiarizationManager::SUBDIR);
+        std::fs::create_dir_all(&diar).unwrap();
+        if sortformer {
+            std::fs::write(diar.join(DiarizationManager::SORTFORMER_FILE), b"gguf").unwrap();
+        }
+        if sherpa {
+            std::fs::write(diar.join(DiarizationManager::SEG_FILE), b"onnx").unwrap();
+            std::fs::write(diar.join(DiarizationManager::EMB_FILE), b"onnx").unwrap();
+        }
+        let manager = DiarizationManager::new(dir.path());
+        (dir, manager)
+    }
+
+    #[test]
+    fn sortformer_wins_when_both_engines_are_installed() {
+        let (_d, m) = manager_with(true, true);
+        assert_eq!(m.engine(), DiarEngine::Sortformer);
+        assert!(m.is_available());
+    }
+
+    #[test]
+    fn an_install_that_only_has_the_onnx_pair_keeps_diarizing() {
+        // Every build before Sortformer shipped. The upgrade must not silently disable
+        // diarization for them.
+        let (_d, m) = manager_with(false, true);
+        assert_eq!(m.engine(), DiarEngine::Sherpa);
+        assert!(m.is_available());
+    }
+
+    #[test]
+    fn sortformer_alone_is_enough() {
+        let (_d, m) = manager_with(true, false);
+        assert_eq!(m.engine(), DiarEngine::Sortformer);
+        assert!(m.is_available());
+    }
+
+    #[test]
+    fn no_models_at_all_is_unavailable() {
+        let (_d, m) = manager_with(false, false);
+        assert!(!m.is_available());
+    }
+
+    // --- A/B harness (not a unit test): run BOTH diarizers over the same WAV and report each
+    // one's speaker count and talk-time split. Needs no DB, so it can be pointed at any recording
+    // whose true speaker count is known — which is the only way to judge a diarizer: against
+    // ground truth, not against the other engine's opinion.
+    //
+    //   HANDY_DIAR_MODELS="$D/models" HANDY_AB_WAV=/path/to/audio.wav HANDY_AB_TRUTH=4 \
+    //   cargo test --lib diarizer_ab -- --ignored --nocapture
+    //
+    // Set HANDY_AB_ENGINE=sortformer|sherpa to run only one side (sherpa is ~10x slower, so a
+    // sweep over several files usually wants sortformer alone).
+    #[test]
+    #[ignore = "A/B bench; needs a WAV + both engines' models via env"]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn diarizer_ab() {
+        let wav = std::env::var("HANDY_AB_WAV").expect("HANDY_AB_WAV");
+        let truth: Option<usize> = std::env::var("HANDY_AB_TRUTH")
+            .ok()
+            .and_then(|s| s.parse().ok());
+        let only = std::env::var("HANDY_AB_ENGINE").unwrap_or_default();
+
+        let mut reader = hound::WavReader::open(&wav).expect("open wav");
+        let spec = reader.spec();
+        assert_eq!(spec.channels, 1, "expected mono");
+        assert_eq!(spec.sample_rate, 16_000, "expected 16 kHz");
+        let samples: Vec<f32> = reader
+            .samples::<i16>()
+            .map(|s| s.expect("pcm sample") as f32 / 32768.0)
+            .collect();
+        let audio_secs = samples.len() as f64 / 16_000.0;
+        eprintln!(
+            "[ab] {} · {:.1} min · truth = {}",
+            std::path::Path::new(&wav)
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy(),
+            audio_secs / 60.0,
+            truth.map(|t| t.to_string()).unwrap_or_else(|| "?".into()),
+        );
+
+        // Talk time per speaker straight from the turns: no ASR needed, and it is the quantity a
+        // reader of the History timeline actually sees.
+        let report = |engine: &str, turns: &[SpeakerTurn], elapsed: std::time::Duration| {
+            use std::collections::BTreeMap;
+            let mut talk: BTreeMap<i64, i64> = BTreeMap::new();
+            for t in turns {
+                *talk.entry(t.speaker).or_default() += t.end_ms - t.start_ms;
+            }
+            let total: i64 = talk.values().sum::<i64>().max(1);
+            let verdict = match truth {
+                Some(k) if talk.len() == k => "  <- matches truth",
+                Some(k) if talk.len() > k => "  <- OVER-counts",
+                Some(_) => "  <- UNDER-counts",
+                None => "",
+            };
+            eprintln!(
+                "[ab] {engine}: {} speakers, {} turns, {:.1}s ({:.0}x real time){verdict}",
+                talk.len(),
+                turns.len(),
+                elapsed.as_secs_f64(),
+                audio_secs / elapsed.as_secs_f64().max(0.001),
+            );
+            let mut ranked: Vec<_> = talk.iter().collect();
+            ranked.sort_by_key(|(_, ms)| std::cmp::Reverse(**ms));
+            for (i, (_, ms)) in ranked.iter().enumerate() {
+                eprintln!(
+                    "       #{:<2} {:>7.1}s  ({:>2.0}%)",
+                    i + 1,
+                    **ms as f64 / 1000.0,
+                    **ms as f64 / total as f64 * 100.0
+                );
+            }
+        };
+
+        // Each side calls its engine's production function DIRECTLY, never `diarize()`: that
+        // one dispatches on what is installed, so routing the sherpa side through it would
+        // silently run sortformer twice and report the comparison as a win.
+        let models = std::env::var("HANDY_DIAR_MODELS").expect("HANDY_DIAR_MODELS");
+        let diarizer = DiarizationManager::new(std::path::Path::new(&models));
+
+        if only != "sherpa" {
+            assert!(
+                diarizer.sortformer_available(),
+                "sortformer.gguf missing under {models}/{}",
+                DiarizationManager::SUBDIR
+            );
+            let t0 = std::time::Instant::now();
+            let turns = diarizer.diarize_sortformer(&samples);
+            report("sortformer", &turns, t0.elapsed());
+        }
+
+        if only != "sortformer" {
+            assert!(
+                diarizer.sherpa_available(),
+                "sherpa models missing under {models}/{}",
+                DiarizationManager::SUBDIR
+            );
+            let t0 = std::time::Instant::now();
+            let turns = diarizer.diarize_sherpa(&samples);
+            report("sherpa    ", &turns, t0.elapsed());
+        }
+    }
+
     // --- one-shot RECOVERY harness (not a unit test): re-diarize a recording whose transcript
     // text is already correct in the DB but whose speaker attribution over-clustered (the 89-min
     // → 104-speakers incident). Reuses the REAL windowed `diarize` + `align`, so calibrating here
@@ -1083,7 +1460,10 @@ mod tests {
 
         // 2) Re-diarize with the REAL windowed engine (calibratable via HANDY_DIAR_THRESHOLD).
         let diarizer = DiarizationManager::new(std::path::Path::new(&models));
-        assert!(diarizer.is_available(), "diarization models missing at {models}");
+        assert!(
+            diarizer.is_available(),
+            "diarization models missing at {models}"
+        );
         let turns = diarizer.diarize(&samples);
         assert!(!turns.is_empty(), "diarization produced no turns");
 
@@ -1186,13 +1566,14 @@ mod tests {
                 &format!(
                     "DELETE FROM speakers WHERE history_id = ? AND id NOT IN ({placeholders})"
                 ),
-                rusqlite::params_from_iter(
-                    std::iter::once(history_id).chain(kept.iter().copied()),
-                ),
+                rusqlite::params_from_iter(std::iter::once(history_id).chain(kept.iter().copied())),
             )
             .unwrap();
             tx.commit().unwrap();
-            eprintln!("[rediar] WROTE {} speakers to history_id {history_id}", dense.len());
+            eprintln!(
+                "[rediar] WROTE {} speakers to history_id {history_id}",
+                dense.len()
+            );
         } else {
             eprintln!("[rediar] read-only (set HANDY_REDIARIZE_WRITE=1 to persist)");
         }

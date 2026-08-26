@@ -1,0 +1,4 @@
+src-tauri/icons/logo.png
+src-tauri/resources/handy.png
+src/components/icons/HandyHand.tsx
+src/components/icons/HandyTextLogo.tsx

@@ -43,3 +43,8 @@ id_rsa*
 
 # ── Agent scratch (decision trails, run evidence) ──
 .atomic-cc/
+
+# ── Fetched model checkpoints (build inputs, not source) ──
+# Sortformer is 139 MB, over GitHub's 100 MB per-file limit; fetch it with
+# scripts/fetch-diarization-model.sh (pinned revision + sha256) before a release build.
+handy/src-tauri/resources/models/diarization/sortformer.gguf

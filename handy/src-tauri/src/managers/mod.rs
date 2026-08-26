@@ -1,7 +1,9 @@
 pub mod audio;
 pub mod auto_capture;
 pub mod diarization;
+pub mod gguf_meta;
 pub mod history;
 pub mod model;
+pub mod model_capabilities;
 pub mod session;
 pub mod transcription;
