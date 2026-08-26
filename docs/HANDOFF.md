@@ -68,14 +68,14 @@ Drop `HANDY_FORCE_AI_STUB` once **full Xcode** is installed (also needed for the
 | --- | --- | --- | --- |
 | Mic long‑form sessions (Fase 0) | `managers/session.rs` | live row 11 ("Pronto, pronto…") | High |
 | System/loopback audio (Fase 1) | `audio_toolkit/audio/system_audio.rs` (CoreAudio Process Tap) | live row 12 ("Ragazzi, buonasera…") | High |
-| Local diarization (Fase 2) | `managers/diarization.rs` + sherpa‑onnx | live rows 9 (2 spk) / 10 (3 spk); `align` unit‑tested | High |
+| Local diarization | `managers/diarization.rs` — **Sortformer** (transcribe‑cpp), sherpa‑onnx as fallback | A/B on real audio ([HANDOFF‑DIARIZATION.md](HANDOFF-DIARIZATION.md)): 35‑min row 57 12→**3** speakers, 91‑min 4‑host podcast → **exactly 4**; ~10× faster; `align` + engine selection unit‑tested | High |
 | Per‑row transcript **status** | migration #6, `TranscriptionStatus` | `transcribing → done/failed`; unit‑tested | High |
 | Menu‑bar **ear** | `tray.rs` `toggle_session` + `lib.rs` listener | compiles; live toggle via CLI/tray | High |
 | **Dual‑stream meeting capture** | `session.rs` `start_sources`/`finalize_session`, `mix_tracks` | **live row 19** (Steve Jobs talk): mic="Me" + system="Speaker 1", merged, accurate transcript | High |
 | **Bleed de‑dup** (`drop_bleed`) | `diarization.rs` | **live row 23**: same speaker‑bleed scenario → collapsed to a single speaker, transcript once; 3 unit tests | High |
 | Startup **self‑healing** | `history.rs` `fail_stale_transcribing()` | unit‑tested; wired before `recover_interrupted` | High |
 | **Local MCP server** (Claude bridge) | `handy/mcp/`, `.mcp.json` | **verified live against the real `history.db`** (returned rows 11/12 + diarized meetings); 4 tests + JSON‑RPC smoke | High |
-| Bundled diarization models | `resources/models/diarization/` | auto‑install on first run → offline | High |
+| Bundled diarization models | `resources/models/diarization/` | auto‑install on first run → offline; Sortformer's 139 MB GGUF is fetched by `scripts/fetch-diarization-model.sh` (gitignored, over GitHub's file limit) | High |
 | Release binary | `tauri build --no-bundle` | built clean, 36 MB | High |
 | **History session‑card result view** | `HistorySettings.tsx` | source icon (meeting/mic/system/dictation) · topic title · date·duration·source meta · speaker chips · collapsible timeline + player + actions | High (live‑validated 2026‑06‑23) |
 | Menu‑bar **"ear"** listening signal | `tray.rs` `TrayIconState::Listening` + `resources/tray_listening.png` | icon flips to an ear whenever a session records (any route); dictation keeps the dot | High |

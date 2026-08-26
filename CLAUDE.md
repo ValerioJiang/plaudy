@@ -10,6 +10,7 @@ built on top of [Handy](https://github.com/cjpais/Handy) as scaffolding.
 - `docs/HANDOFF-FASE2.md` — line-cited forensic detail of the Fase 2 diarization work + the sessions-UI plan.
 - `docs/HANDOFF-AUTOCAPTURE.md` — line-cited forensics of the 2026-07-05 session: per-process auto-capture trigger unshelved (what/how/evidence/remaining) + the resolved MCP-as-AI-path decision.
 - `docs/HANDOFF-LANDING.md` — the 2026-07-05 landing-page session: `site/` live at plaudy.vercel.app (Vercel git-connected, auto-deploys on push), the two skills used (seo-2026-sota + impeccable) and their edit rules, og.png regen procedure, what remains (custom domain, GSC, GEO distribution).
+- `docs/HANDOFF-DIARIZATION.md` — the 2026-08-26 diarization session: why the speaker count was wrong (crumb speakers + identity lost at window seams, both properties of sherpa's clustering, neither tunable) and the switch to NVIDIA Streaming Sortformer via transcribe-cpp. **Read before touching diarization.**
 - `docs/HANDOFF-HARDENING.md` — the 2026-07-05 end-to-end hardening session: 25 bugs / 18 refactors / test suite 106→144 Rust + 4→13 MCP. Behavior changes to know: `archive_tracks` audio-safety invariant, auto-capture rewritten as pure `Supervisor::tick` (churn fix, probation now a 60 s failsafe, cancel-not-finalize for silent sessions), recorder command-first loop (stop/close deadlock fix), derived tray state, WAL + busy_timeout, migration #7 (`source` column), `session_elapsed_ms`. **Read before touching session/auto-capture/recorder.**
 - `README.md` — project landing page / index.
 - `docs/handy-architecture/` — forensic architecture docs of Handy + the Plaud gap analysis & roadmap.
@@ -31,6 +32,7 @@ export CMAKE_POLICY_VERSION_MINIMUM=3.5   # CMake 4 dropped pre-3.5 policy compa
 export HANDY_FORCE_AI_STUB=1              # build the Apple Intelligence stub without full Xcode
 cd handy && bun tauri dev                 # or: cd handy/src-tauri && cargo build / cargo test --lib session
 ```
+- **Once per clone, and before any release build:** `scripts/fetch-diarization-model.sh`. It fetches the 139 MB Sortformer checkpoint (pinned revision + sha256) into `handy/src-tauri/resources/models/diarization/sortformer.gguf`, which `tauri build` then bundles. The file is gitignored — it is over GitHub's 100 MB per-file limit, and a checkpoint is a build input, not source. Skipping the script still builds a working app; it just falls back to the older sherpa diarizer.
 - `HANDY_FORCE_AI_STUB=1` is an escape hatch added to `handy/src-tauri/build.rs`: the CLT SDK ships `FoundationModels.framework` but not the `@Generable` macro plugin. Drop it once **full Xcode** is installed (also needed later for the iPhone target).
 - App data: `~/Library/Application Support/com.uppify.plaudy/` (`history.db` + `recordings/`).
 - Long-form sessions: `./handy --toggle-session` (mic) · `./handy --toggle-system-session` (system audio). macOS Intel would need ONNX Runtime via Homebrew (see `handy/BUILD.md`); we're on Apple Silicon.

@@ -1358,13 +1358,23 @@ impl ModelManager {
 
     /// Install the bundled speaker-diarization models from the app's `resources/` into the
     /// app-data `diarization/` dir on first run, so a fresh checkout has "who said what"
-    /// ready offline: no download, no manual copy. Mirrors `migrate_bundled_models`, and is
+    /// ready offline: no download, no manual copy.
+    ///
+    /// Three files, one per engine plus the sherpa pair. Each is copied independently and a
+    /// missing one is skipped, which is what makes the Sortformer rollout safe both ways: a
+    /// build made without `scripts/fetch-diarization-model.sh` still installs the ONNX pair and
+    /// diarizes (via sherpa), and an existing install that already has the pair picks up
+    /// Sortformer on the next launch without touching what is already there. Mirrors `migrate_bundled_models`, and is
     /// a no-op once the user-dir copies exist or when the models are not bundled (then the
     /// `download_diarization_models` command is the fallback). Filenames come from the shared
     /// `DiarizationManager` consts so the bundle path and the engine's read path cannot drift.
     fn migrate_bundled_diarization_models(&self) -> Result<()> {
         let dest_dir = self.models_dir.join(DiarizationManager::SUBDIR);
-        for filename in [DiarizationManager::SEG_FILE, DiarizationManager::EMB_FILE] {
+        for filename in [
+            DiarizationManager::SORTFORMER_FILE,
+            DiarizationManager::SEG_FILE,
+            DiarizationManager::EMB_FILE,
+        ] {
             let user_path = dest_dir.join(filename);
             if user_path.exists() {
                 continue;
@@ -1401,6 +1411,12 @@ impl ModelManager {
     /// Idempotent: files already present are skipped, so this is safe to call repeatedly
     /// (e.g. from a UI "Enable diarization" button). Each file is streamed to a `.partial`,
     /// size- and SHA256-verified, then atomically renamed into place.
+    ///
+    /// This fetches the sherpa ONNX pair only, NOT Sortformer. Sortformer is 139 MB and this
+    /// downloader has no resume and no cancel (see the note below), which is fine for two files
+    /// under 40 MB and not fine for one at 139 MB. Sortformer therefore rides in the app bundle
+    /// (`scripts/fetch-diarization-model.sh` puts it in `resources/`), and this stays the
+    /// recovery path that gets an install back to *some* working diarizer.
     ///
     /// No resume, range or cancel here (unlike `download_model`): both files are under 40 MB,
     /// so a failed download just retries from scratch. Ceiling: a flaky connection restarts
