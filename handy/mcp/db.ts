@@ -147,15 +147,69 @@ export interface SearchHit {
   snippet: string;
 }
 
-/** Find sessions whose flat transcript OR any speaker segment contains `query` (case-insensitive). */
+/** Shortest query the trigram index can serve (a trigram is 3 characters). */
+const FTS_MIN_QUERY_CHARS = 3;
+
+function hasTable(db: Database, name: string): boolean {
+  return (
+    db
+      .query(
+        "SELECT 1 AS ok FROM sqlite_master WHERE type = 'table' AND name = ?",
+      )
+      .get(name) != null
+  );
+}
+
+/**
+ * Find sessions whose flat transcript OR any speaker segment contains `query` (case-insensitive).
+ *
+ * DATA-002: queries of 3+ characters use the app's trigram FTS5 index (`history_fts`,
+ * `segments_fts`), where a quoted string is a case-insensitive substring match: the same rows
+ * as the LIKE scan, without reading every transcript. The LIKE scan stays for shorter queries
+ * and for a DB the app has not migrated yet (this process never writes, so it cannot create
+ * the index itself).
+ */
 export function searchSessions(
   db: Database,
   query: string,
   limit = 20,
 ): SearchHit[] {
+  const useFts =
+    [...query].length >= FTS_MIN_QUERY_CHARS &&
+    hasTable(db, "history_fts") &&
+    hasTable(db, "segments_fts");
+  const rows = useFts ? ftsRows(db, query, limit) : likeRows(db, query, limit);
+  return rows.map((r) => ({
+    id: r.id,
+    title: r.title,
+    timestamp: r.timestamp,
+    snippet: matchSnippet(r.transcription_text ?? "", query),
+  }));
+}
+
+function ftsRows(db: Database, query: string, limit: number): Row[] {
+  // One FTS5 string literal ("" escapes a quote), restricted to the transcript column so the
+  // title is not searched: same scope as the LIKE path.
+  const phrase = `transcription_text : "${query.replace(/"/g, '""')}"`;
+  const segPhrase = `"${query.replace(/"/g, '""')}"`;
+  return db
+    .query(
+      `SELECT h.id AS id, h.title AS title, h.timestamp AS timestamp,
+              h.transcription_text AS transcription_text
+         FROM transcription_history h
+        WHERE h.id IN (SELECT rowid FROM history_fts WHERE history_fts MATCH ?1)
+           OR h.id IN (SELECT s.history_id FROM transcription_segments s
+                        WHERE s.id IN (SELECT rowid FROM segments_fts WHERE segments_fts MATCH ?2))
+        ORDER BY h.id DESC
+        LIMIT ?3`,
+    )
+    .all(phrase, segPhrase, limit) as Row[];
+}
+
+function likeRows(db: Database, query: string, limit: number): Row[] {
   // Escape LIKE metacharacters so "100%" or "snake_case" mean the literal text, not wildcards.
   const like = `%${query.replace(/[\\%_]/g, "\\$&")}%`;
-  const rows = db
+  return db
     .query(
       `SELECT DISTINCT h.id AS id, h.title AS title, h.timestamp AS timestamp,
                        h.transcription_text AS transcription_text
@@ -166,12 +220,6 @@ export function searchSessions(
         LIMIT ?`,
     )
     .all(like, like, limit) as Row[];
-  return rows.map((r) => ({
-    id: r.id,
-    title: r.title,
-    timestamp: r.timestamp,
-    snippet: matchSnippet(r.transcription_text ?? "", query),
-  }));
 }
 
 interface Row {

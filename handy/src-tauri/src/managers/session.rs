@@ -1881,6 +1881,7 @@ mod tests {
                 post_process_requested: false,
                 status: TranscriptionStatus::Transcribing,
                 source,
+                audio_purged_at: None,
             })
         }
         fn save_segments(&self, _history_id: i64, segments: &[TimedSegment]) -> Result<()> {

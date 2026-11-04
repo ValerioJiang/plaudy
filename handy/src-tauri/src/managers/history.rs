@@ -65,7 +65,63 @@ static MIGRATIONS: &[M] = &[
     // from magic speaker labels. Empty default = pre-migration row → the UI falls back to
     // its old inference. APPEND-ONLY.
     M::up("ALTER TABLE transcription_history ADD COLUMN source TEXT NOT NULL DEFAULT '';"),
+    // DATA-001: when retention deleted a session's audio (unix seconds); NULL = audio kept.
+    // The row, transcript, speakers and segments stay. APPEND-ONLY.
+    M::up("ALTER TABLE transcription_history ADD COLUMN audio_purged_at INTEGER;"),
+    // DATA-002: full-text index. External-content FTS5 tables (no second copy of the text)
+    // with the `trigram` tokenizer, so a MATCH on a quoted string is a case-insensitive
+    // *substring* match: exactly the old LIKE '%q%' semantics, indexed. Triggers keep them in
+    // sync; the UPDATE triggers fire only on the indexed columns so status/saved flips cost
+    // nothing. Segment rows removed by the ON DELETE CASCADE fire their delete trigger too.
+    // The trailing 'rebuild's index every row that predates this migration. APPEND-ONLY.
+    M::up(
+        "CREATE VIRTUAL TABLE IF NOT EXISTS history_fts USING fts5(
+            title, transcription_text,
+            content='transcription_history', content_rowid='id', tokenize='trigram'
+        );
+        CREATE TRIGGER IF NOT EXISTS history_fts_ai AFTER INSERT ON transcription_history BEGIN
+            INSERT INTO history_fts(rowid, title, transcription_text)
+            VALUES (new.id, new.title, new.transcription_text);
+        END;
+        CREATE TRIGGER IF NOT EXISTS history_fts_ad AFTER DELETE ON transcription_history BEGIN
+            INSERT INTO history_fts(history_fts, rowid, title, transcription_text)
+            VALUES ('delete', old.id, old.title, old.transcription_text);
+        END;
+        CREATE TRIGGER IF NOT EXISTS history_fts_au
+        AFTER UPDATE OF title, transcription_text ON transcription_history BEGIN
+            INSERT INTO history_fts(history_fts, rowid, title, transcription_text)
+            VALUES ('delete', old.id, old.title, old.transcription_text);
+            INSERT INTO history_fts(rowid, title, transcription_text)
+            VALUES (new.id, new.title, new.transcription_text);
+        END;
+        CREATE VIRTUAL TABLE IF NOT EXISTS segments_fts USING fts5(
+            text, content='transcription_segments', content_rowid='id', tokenize='trigram'
+        );
+        CREATE TRIGGER IF NOT EXISTS segments_fts_ai AFTER INSERT ON transcription_segments BEGIN
+            INSERT INTO segments_fts(rowid, text) VALUES (new.id, new.text);
+        END;
+        CREATE TRIGGER IF NOT EXISTS segments_fts_ad AFTER DELETE ON transcription_segments BEGIN
+            INSERT INTO segments_fts(segments_fts, rowid, text) VALUES ('delete', old.id, old.text);
+        END;
+        CREATE TRIGGER IF NOT EXISTS segments_fts_au
+        AFTER UPDATE OF text ON transcription_segments BEGIN
+            INSERT INTO segments_fts(segments_fts, rowid, text) VALUES ('delete', old.id, old.text);
+            INSERT INTO segments_fts(rowid, text) VALUES (new.id, new.text);
+        END;
+        INSERT INTO history_fts(history_fts) VALUES ('rebuild');
+        INSERT INTO segments_fts(segments_fts) VALUES ('rebuild');",
+    ),
 ];
+
+/// SQL predicate for "this row is a long-form session" (meeting / mic / system recording), as
+/// opposed to a one-shot dictation. `source` is authoritative since migration #7; rows older
+/// than that are recognised by the session file-name prefix `session-` (session.rs).
+const SESSION_ROW_SQL: &str =
+    "(source IN ('mic', 'system', 'meeting') OR file_name LIKE 'session-%')";
+
+/// Shortest query that can use the trigram index (a trigram is 3 characters). Shorter
+/// queries fall back to the LIKE scan, with identical results.
+const FTS_MIN_QUERY_CHARS: usize = 3;
 
 #[derive(Clone, Debug, Serialize, Deserialize, Type)]
 pub struct PaginatedHistory {
@@ -167,6 +223,8 @@ pub struct HistoryEntry {
     pub post_process_requested: bool,
     pub status: TranscriptionStatus,
     pub source: EntrySource,
+    /// Unix seconds when retention deleted this session's audio (DATA-001); `None` = audio kept.
+    pub audio_purged_at: Option<i64>,
 }
 
 /// A persisted, speaker-attributed transcript segment — the read shape for the timeline UI.
@@ -336,6 +394,13 @@ fn fail_stale_transcribing(conn: &Connection) -> Result<usize> {
         "UPDATE transcription_history SET status = 'failed' WHERE status = 'transcribing'",
         [],
     )?)
+}
+
+/// The user's text as one FTS5 string literal: with the trigram tokenizer that is a substring
+/// match of the whole query, punctuation included. `"` is the only character that needs
+/// escaping inside an FTS5 string (doubled).
+fn fts_phrase(query: &str) -> String {
+    format!("\"{}\"", query.replace('"', "\"\""))
 }
 
 #[cfg(test)]
@@ -708,6 +773,12 @@ impl HistoryManager {
         // Initialize database and run migrations synchronously
         manager.init_database()?;
 
+        // Audio of sessions finished while the app was closed ages out at launch too, not only
+        // on the next recording (DATA-001). Never fatal.
+        if let Err(e) = manager.purge_session_audio() {
+            error!("Session audio retention sweep at startup failed: {e}");
+        }
+
         Ok(manager)
     }
 
@@ -825,7 +896,7 @@ impl HistoryManager {
 
     /// The columns `map_history_entry` reads — one place instead of seven copies of the
     /// SELECT list. Adding a column = this constant + the mapper + a migration.
-    const HISTORY_COLUMNS: &'static str = "id, file_name, timestamp, saved, title, transcription_text, post_processed_text, post_process_prompt, post_process_requested, status, source";
+    const HISTORY_COLUMNS: &'static str = "id, file_name, timestamp, saved, title, transcription_text, post_processed_text, post_process_prompt, post_process_requested, status, source, audio_purged_at";
 
     fn map_history_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<HistoryEntry> {
         Ok(HistoryEntry {
@@ -840,6 +911,7 @@ impl HistoryManager {
             post_process_requested: row.get("post_process_requested")?,
             status: TranscriptionStatus::from_db(&row.get::<_, String>("status")?),
             source: EntrySource::from_db(&row.get::<_, String>("source")?),
+            audio_purged_at: row.get("audio_purged_at")?,
         })
     }
 
@@ -941,6 +1013,7 @@ impl HistoryManager {
             post_process_requested,
             status,
             source,
+            audio_purged_at: None,
         };
 
         debug!("Saved history entry with id {}", entry.id);
@@ -1189,10 +1262,17 @@ impl HistoryManager {
         }
     }
 
+    /// Retention sweep, run on every insert and on retention-setting changes.
+    ///
+    /// Two independent rules (DATA-001):
+    /// - **Dictation rows** follow `recording_retention_period` / `history_limit` exactly as
+    ///   before: the whole row and its WAV go.
+    /// - **Session rows** (meetings, mic/system recordings) are never deleted by retention; only
+    ///   their audio is, by [`Self::purge_session_audio`].
     pub fn cleanup_old_entries(&self) -> Result<()> {
         let retention_period = crate::settings::get_recording_retention_period(&self.app_handle);
 
-        match retention_period {
+        let rows = match retention_period {
             // Don't delete anything
             crate::settings::RecordingRetentionPeriod::Never => Ok(()),
             // Count-based logic with history_limit
@@ -1201,7 +1281,87 @@ impl HistoryManager {
             }
             // Time-based logic
             _ => self.cleanup_by_time(retention_period),
+        };
+        // The audio purge must not be skipped because the row sweep failed, nor fail the insert
+        // that triggered it: log and carry on.
+        if let Err(e) = self.purge_session_audio() {
+            error!("Session audio retention sweep failed: {e}");
         }
+        rows
+    }
+
+    /// Delete the WAV of every finished, unstarred session older than
+    /// `session_audio_retention`, keeping the row (transcript, speakers, segments) and stamping
+    /// `audio_purged_at`. Returns how many recordings were purged.
+    ///
+    /// Safety rules: only `status = 'done'` rows (a failed or pending transcript still needs
+    /// its audio for retry, whatever its age); never a starred row (`saved = 1`); a WAV that
+    /// exists but cannot be deleted is logged and left unmarked so the next sweep retries it;
+    /// a WAV already missing is marked (there is nothing left to keep).
+    pub fn purge_session_audio(&self) -> Result<usize> {
+        // Fallible read: this also runs at startup and must never panic the app.
+        let Ok(settings) = crate::settings::try_get_settings(&self.app_handle) else {
+            return Ok(0);
+        };
+        let Some(days) = settings.session_audio_retention.days() else {
+            return Ok(0);
+        };
+        let now = Utc::now().timestamp();
+        let cutoff = now - days * 24 * 60 * 60;
+
+        let conn = self.get_connection()?;
+        let candidates = Self::sessions_with_purgeable_audio(&conn, cutoff)?;
+        let mut purged = Vec::new();
+        for (id, file_name) in candidates {
+            let path = self.recordings_dir.join(&file_name);
+            match fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    error!("Audio retention: could not delete {file_name}: {e}; will retry");
+                    continue;
+                }
+            }
+            Self::mark_audio_purged(&conn, id, now)?;
+            purged.push(id);
+        }
+        drop(conn);
+
+        if !purged.is_empty() {
+            info!(
+                "Audio retention: removed the audio of {} session(s) older than {days} days; transcripts kept",
+                purged.len()
+            );
+        }
+        for id in &purged {
+            if let Ok(Some(entry)) = self.get_entry_by_id(*id) {
+                self.emit_updated(&entry);
+            }
+        }
+        Ok(purged.len())
+    }
+
+    /// Finished, unstarred session rows older than `cutoff` whose audio is still on disk.
+    fn sessions_with_purgeable_audio(conn: &Connection, cutoff: i64) -> Result<Vec<(i64, String)>> {
+        let mut stmt = conn.prepare(&format!(
+            "SELECT id, file_name FROM transcription_history
+             WHERE {SESSION_ROW_SQL}
+               AND status = 'done' AND saved = 0 AND audio_purged_at IS NULL
+               AND timestamp < ?1
+             ORDER BY timestamp"
+        ))?;
+        let rows = stmt
+            .query_map(params![cutoff], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    fn mark_audio_purged(conn: &Connection, id: i64, now: i64) -> Result<()> {
+        conn.execute(
+            "UPDATE transcription_history SET audio_purged_at = ?2 WHERE id = ?1",
+            params![id, now],
+        )?;
+        Ok(())
     }
 
     fn delete_entries_and_files(&self, entries: &[(i64, String)]) -> Result<usize> {
@@ -1242,11 +1402,13 @@ impl HistoryManager {
 
     /// Unsaved entries beyond the newest `limit` (count-based retention), on a borrowed
     /// connection so the boundary (`saved = 1` exemption, exactly-`limit` no-op) is testable.
+    /// Session rows are exempt (DATA-001): `history_limit` counts dictations only.
     fn entries_beyond_count(conn: &Connection, limit: usize) -> Result<Vec<(i64, String)>> {
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare(&format!(
             "SELECT id, file_name FROM transcription_history
-             WHERE saved = 0 ORDER BY timestamp DESC LIMIT -1 OFFSET ?1",
-        )?;
+             WHERE saved = 0 AND NOT {SESSION_ROW_SQL}
+             ORDER BY timestamp DESC LIMIT -1 OFFSET ?1"
+        ))?;
         let rows = stmt
             .query_map(params![limit as i64], |row| {
                 Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
@@ -1256,10 +1418,12 @@ impl HistoryManager {
     }
 
     /// Unsaved entries strictly older than `cutoff_timestamp` (time-based retention).
+    /// Session rows are exempt (DATA-001): only their audio ages out.
     fn entries_older_than(conn: &Connection, cutoff_timestamp: i64) -> Result<Vec<(i64, String)>> {
-        let mut stmt = conn.prepare(
-            "SELECT id, file_name FROM transcription_history WHERE saved = 0 AND timestamp < ?1",
-        )?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT id, file_name FROM transcription_history
+             WHERE saved = 0 AND NOT {SESSION_ROW_SQL} AND timestamp < ?1"
+        ))?;
         let rows = stmt
             .query_map(params![cutoff_timestamp], |row| {
                 Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
@@ -1308,12 +1472,32 @@ impl HistoryManager {
 
     /// Substring search over transcript + title, newest first. Pure SQL on a
     /// borrowed connection so it is unit-testable without an AppHandle.
+    ///
+    /// Queries of 3+ characters go through the trigram index `history_fts` (DATA-002): a
+    /// quoted FTS5 string is a case-insensitive substring match, so results equal the LIKE
+    /// scan below, which remains for shorter queries and databases without the index.
     /// LIKE wildcards in the user's query are escaped → always a literal match.
     pub fn search_entries_conn(
         conn: &Connection,
         query: &str,
         limit: usize,
     ) -> Result<Vec<HistoryEntry>> {
+        if query.chars().count() >= FTS_MIN_QUERY_CHARS && Self::has_table(conn, "history_fts") {
+            let mut stmt = conn.prepare(&format!(
+                "SELECT {} FROM transcription_history
+                 WHERE id IN (SELECT rowid FROM history_fts WHERE history_fts MATCH ?1)
+                 ORDER BY id DESC
+                 LIMIT ?2",
+                Self::HISTORY_COLUMNS
+            ))?;
+            let rows = stmt
+                .query_map(
+                    params![fts_phrase(query), limit as i64],
+                    Self::map_history_entry,
+                )?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            return Ok(rows);
+        }
         let escaped = query
             .replace('\\', "\\\\")
             .replace('%', "\\%")
@@ -1330,6 +1514,15 @@ impl HistoryManager {
             .query_map(params![pattern, limit as i64], Self::map_history_entry)?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(rows)
+    }
+
+    fn has_table(conn: &Connection, name: &str) -> bool {
+        conn.query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            params![name],
+            |_| Ok(()),
+        )
+        .is_ok()
     }
 
     pub fn search_history_entries(
@@ -1547,7 +1740,8 @@ mod tests {
                 post_process_prompt TEXT,
                 post_process_requested BOOLEAN NOT NULL DEFAULT 0,
                 status TEXT NOT NULL DEFAULT 'done',
-                source TEXT NOT NULL DEFAULT ''
+                source TEXT NOT NULL DEFAULT '',
+                audio_purged_at INTEGER
             );",
         )
         .expect("create transcription_history table");
@@ -1877,5 +2071,327 @@ mod tests {
             .is_err(),
             "updating a missing row must surface, not silently no-op"
         );
+    }
+}
+
+/// DATA-001 (session audio retention) and DATA-002 (full-text index), against the real
+/// migrations so the triggers and the FTS tables are the ones the app ships.
+#[cfg(test)]
+mod retention_and_fts_tests {
+    use super::*;
+
+    fn migrated() -> Connection {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+        Migrations::new(MIGRATIONS.to_vec())
+            .to_latest(&mut conn)
+            .unwrap();
+        conn
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn row(
+        conn: &Connection,
+        file: &str,
+        ts: i64,
+        saved: bool,
+        status: &str,
+        source: &str,
+        title: &str,
+        text: &str,
+    ) -> i64 {
+        conn.execute(
+            "INSERT INTO transcription_history
+                (file_name, timestamp, saved, title, transcription_text, status, source)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![file, ts, saved, title, text, status, source],
+        )
+        .unwrap();
+        conn.last_insert_rowid()
+    }
+
+    fn session(conn: &Connection, ts: i64, status: &str) -> i64 {
+        row(
+            conn,
+            &format!("session-{ts}-0.wav"),
+            ts,
+            false,
+            status,
+            "meeting",
+            "m",
+            "x",
+        )
+    }
+
+    fn dictation(conn: &Connection, ts: i64) -> i64 {
+        row(
+            conn,
+            &format!("handy-{ts}.wav"),
+            ts,
+            false,
+            "done",
+            "dictation",
+            "d",
+            "x",
+        )
+    }
+
+    fn ids(v: Vec<(i64, String)>) -> Vec<i64> {
+        let mut out: Vec<i64> = v.into_iter().map(|(id, _)| id).collect();
+        out.sort();
+        out
+    }
+
+    // ----- DATA-001 -------------------------------------------------------------------------
+
+    #[test]
+    fn count_retention_counts_and_deletes_dictations_only() {
+        let conn = migrated();
+        let s1 = session(&conn, 1, "done");
+        let d1 = dictation(&conn, 2);
+        let _s2 = session(&conn, 3, "done");
+        let d2 = dictation(&conn, 4);
+        let _d3 = dictation(&conn, 5);
+        // Keep the newest 1 dictation: d1, d2 go; no session is ever a candidate.
+        let gone = ids(HistoryManager::entries_beyond_count(&conn, 1).unwrap());
+        assert_eq!(gone, vec![d1, d2]);
+        assert!(!gone.contains(&s1));
+    }
+
+    #[test]
+    fn time_retention_skips_sessions_including_legacy_unlabelled_ones() {
+        let conn = migrated();
+        let _new_source = session(&conn, 10, "done");
+        // A pre-migration-#7 session row: empty source, recognised by its file name.
+        let _legacy = row(&conn, "session-11-0.wav", 11, false, "done", "", "t", "x");
+        let old_dictation = dictation(&conn, 12);
+        let legacy_dictation = row(&conn, "handy-13.wav", 13, false, "done", "", "t", "x");
+        let gone = ids(HistoryManager::entries_older_than(&conn, 100).unwrap());
+        assert_eq!(gone, vec![old_dictation, legacy_dictation]);
+    }
+
+    #[test]
+    fn audio_purge_selects_only_finished_unstarred_sessions_past_the_cutoff() {
+        let conn = migrated();
+        let old_done = session(&conn, 10, "done");
+        let _old_failed = session(&conn, 11, "failed"); // retry still needs the audio
+        let _old_pending = session(&conn, 12, "transcribing");
+        let _old_starred = row(
+            &conn,
+            "session-13-0.wav",
+            13,
+            true,
+            "done",
+            "meeting",
+            "t",
+            "x",
+        );
+        let _old_dictation = dictation(&conn, 14); // dictation audio is not this rule's
+        let legacy_done = row(&conn, "session-15-0.wav", 15, false, "done", "", "t", "x");
+        let _recent_done = session(&conn, 500, "done");
+        let picked = ids(HistoryManager::sessions_with_purgeable_audio(&conn, 100).unwrap());
+        assert_eq!(picked, vec![old_done, legacy_done]);
+    }
+
+    #[test]
+    fn a_purged_session_is_not_picked_again_and_keeps_its_transcript() {
+        let conn = migrated();
+        let id = session(&conn, 10, "done");
+        HistoryManager::mark_audio_purged(&conn, id, 999).unwrap();
+        assert!(HistoryManager::sessions_with_purgeable_audio(&conn, 100)
+            .unwrap()
+            .is_empty());
+        let (purged_at, text): (Option<i64>, String) = conn
+            .query_row(
+                "SELECT audio_purged_at, transcription_text FROM transcription_history WHERE id = ?1",
+                params![id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(purged_at, Some(999));
+        assert_eq!(text, "x");
+    }
+
+    #[test]
+    fn session_audio_retention_periods() {
+        use crate::settings::SessionAudioRetention as R;
+        assert_eq!(R::Days7.days(), Some(7));
+        assert_eq!(R::Days30.days(), Some(30));
+        assert_eq!(R::Days90.days(), Some(90));
+        assert_eq!(R::Forever.days(), None);
+    }
+
+    // ----- DATA-002 -------------------------------------------------------------------------
+
+    fn search(conn: &Connection, q: &str) -> Vec<i64> {
+        HistoryManager::search_entries_conn(conn, q, 50)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.id)
+            .collect()
+    }
+
+    fn segment_hits(conn: &Connection, q: &str) -> i64 {
+        conn.query_row(
+            "SELECT count(*) FROM segments_fts WHERE segments_fts MATCH ?1",
+            params![fts_phrase(q)],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn fts_finds_by_title_and_transcript_case_insensitively_newest_first() {
+        let conn = migrated();
+        let a = row(
+            &conn,
+            "a.wav",
+            1,
+            false,
+            "done",
+            "meeting",
+            "Quarterly review",
+            "budget up",
+        );
+        let b = row(
+            &conn,
+            "b.wav",
+            2,
+            false,
+            "done",
+            "meeting",
+            "Standup",
+            "the BUDGET is fine",
+        );
+        assert_eq!(search(&conn, "quarterly"), vec![a]);
+        assert_eq!(search(&conn, "Budget"), vec![b, a]);
+        // Substring inside a word, like the old LIKE '%q%'.
+        assert_eq!(search(&conn, "udge"), vec![b, a]);
+        assert!(search(&conn, "nowhere").is_empty());
+    }
+
+    #[test]
+    fn fts_follows_updates_and_deletes() {
+        let conn = migrated();
+        let id = row(&conn, "a.wav", 1, false, "transcribing", "meeting", "t", "");
+        assert!(search(&conn, "fatturato").is_empty());
+        // The finalize path fills the transcript in later with an UPDATE.
+        conn.execute(
+            "UPDATE transcription_history SET transcription_text = 'il fatturato cresce', status = 'done' WHERE id = ?1",
+            params![id],
+        )
+        .unwrap();
+        assert_eq!(search(&conn, "fatturato"), vec![id]);
+        conn.execute(
+            "UPDATE transcription_history SET transcription_text = 'tutto rivisto' WHERE id = ?1",
+            params![id],
+        )
+        .unwrap();
+        assert!(search(&conn, "fatturato").is_empty());
+        assert_eq!(search(&conn, "rivisto"), vec![id]);
+        conn.execute(
+            "DELETE FROM transcription_history WHERE id = ?1",
+            params![id],
+        )
+        .unwrap();
+        assert!(search(&conn, "rivisto").is_empty());
+    }
+
+    #[test]
+    fn segment_index_follows_inserts_and_the_cascade_delete() {
+        let conn = migrated();
+        let id = row(&conn, "a.wav", 1, false, "done", "meeting", "t", "x");
+        conn.execute(
+            "INSERT INTO transcription_segments (history_id, start_ms, end_ms, text) VALUES (?1, 0, 1000, 'parliamo del trimestre')",
+            params![id],
+        )
+        .unwrap();
+        assert_eq!(segment_hits(&conn, "trimestre"), 1);
+        conn.execute(
+            "DELETE FROM transcription_history WHERE id = ?1",
+            params![id],
+        )
+        .unwrap();
+        assert_eq!(
+            segment_hits(&conn, "trimestre"),
+            0,
+            "cascade must clean the index"
+        );
+    }
+
+    #[test]
+    fn rows_that_predate_the_index_are_found_after_the_migration() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        let before_fts = MIGRATIONS.len() - 1;
+        Migrations::new(MIGRATIONS[..before_fts].to_vec())
+            .to_latest(&mut conn)
+            .unwrap();
+        let id = row(
+            &conn,
+            "old.wav",
+            1,
+            false,
+            "done",
+            "meeting",
+            "t",
+            "vecchia riunione",
+        );
+        Migrations::new(MIGRATIONS.to_vec())
+            .to_latest(&mut conn)
+            .unwrap();
+        assert_eq!(search(&conn, "riunione"), vec![id]);
+    }
+
+    #[test]
+    fn fts_and_the_like_fallback_return_the_same_rows() {
+        let conn = migrated();
+        for (i, text) in [
+            "sconto del 100% applicato subito",
+            "100 giorni di prova gratuita",
+            "variabile snake_case rinominata",
+            "la meccanica del motore",
+            "cartella C:\\temp aperta",
+            "virgolette \"doppie\" nel testo",
+            "Perché è così",
+        ]
+        .iter()
+        .enumerate()
+        {
+            row(
+                &conn,
+                &format!("{i}.wav"),
+                i as i64,
+                false,
+                "done",
+                "meeting",
+                "t",
+                text,
+            );
+        }
+        let queries = [
+            "100%",
+            "e_c",
+            "C:\\temp",
+            "\"doppie\"",
+            "PERCHÉ",
+            "giorni di",
+            "ecc",
+            "zzz",
+            "100",
+        ];
+        let with_fts: Vec<Vec<i64>> = queries.iter().map(|q| search(&conn, q)).collect();
+        conn.execute_batch("DROP TABLE history_fts;").unwrap();
+        let with_like: Vec<Vec<i64>> = queries.iter().map(|q| search(&conn, q)).collect();
+        for ((q, f), l) in queries.iter().zip(&with_fts).zip(&with_like) {
+            // SQLite's LIKE folds ASCII case only; the trigram index folds Unicode case too, so
+            // for non-ASCII letters FTS may find strictly more. Everything else is identical.
+            if q.is_ascii() {
+                assert_eq!(f, l, "query {q:?}");
+            } else {
+                assert!(l.iter().all(|id| f.contains(id)), "query {q:?}");
+            }
+        }
+        assert_eq!(with_fts[0].len(), 1, "100% is literal");
+        assert_eq!(with_fts[1].len(), 1, "e_c is literal");
     }
 }

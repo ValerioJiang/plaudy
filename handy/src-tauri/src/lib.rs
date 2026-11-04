@@ -952,6 +952,7 @@ pub fn run(cli_args: CliArgs) {
             commands::history::retry_history_entry_transcription,
             commands::history::update_history_limit,
             commands::history::update_recording_retention_period,
+            commands::history::update_session_audio_retention,
             helpers::clamshell::is_laptop,
         ])
         .events(collect_events![

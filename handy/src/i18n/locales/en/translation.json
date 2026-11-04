@@ -445,6 +445,7 @@
       "loading": "Loading history...",
       "empty": "No transcriptions yet. Start recording to build your history!",
       "copyToClipboard": "Copy transcription to clipboard",
+      "audioPurged": "Audio removed after the retention period. The transcript is kept.",
       "save": "Save transcription",
       "unsave": "Remove from saved",
       "delete": "Delete entry",
@@ -639,6 +640,14 @@
       "capturingMic": "Capturing microphone",
       "capturingSystem": "Capturing system audio",
       "privacyNote": "Records your microphone and this Mac's audio as two streams, separated by speaker. Nothing ever leaves your Mac.",
+      "audioRetention": {
+        "title": "Keep meeting audio",
+        "description": "Recordings are deleted after this period once their transcript is ready. Transcripts, speakers and starred sessions are always kept.",
+        "days7": "7 days",
+        "days30": "30 days",
+        "days90": "90 days",
+        "forever": "Forever"
+      },
       "autoCapture": {
         "title": "Auto-capture",
         "description": "Start a meeting session automatically when another app plays audio (a call, a video), and stop when it goes quiet. Experimental — everything stays on this Mac.",

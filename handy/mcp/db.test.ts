@@ -84,6 +84,54 @@ test("searchSessions treats LIKE metacharacters as literal text", () => {
   expect(searchSessions(db, "\\", 10).map((h) => h.id)).toEqual([7]);
 });
 
+test("FTS and the LIKE fallback (pre-migration DB) return the same sessions", () => {
+  const texts = [
+    "sconto del 100% applicato subito",
+    "100 giorni di prova gratuita",
+    "variabile snake_case rinominata",
+    "la meccanica del motore",
+    'virgolette "doppie" nel testo',
+  ];
+  const withFts = createDb();
+  const without = createDb(":memory:", { fts: false });
+  for (const db of [withFts, without]) {
+    seedSessions(db);
+    texts.forEach((t, i) => insertSession(db, 10 + i, t));
+  }
+  for (const q of [
+    "budget",
+    "trimestre",
+    "100%",
+    "e_c",
+    '"doppie"',
+    "giorni di",
+    "ecc",
+    "zzz",
+    "Session",
+    "_",
+  ]) {
+    const a = searchSessions(withFts, q, 50).map((h) => h.id);
+    const b = searchSessions(without, q, 50).map((h) => h.id);
+    expect({ q, ids: a }).toEqual({ q, ids: b });
+  }
+  // Title text is not in scope on either path ("Session 10" is only a title).
+  expect(searchSessions(withFts, "Session", 50)).toEqual([]);
+});
+
+test("the FTS index follows a transcript filled in later and a deleted session", () => {
+  const db = createDb();
+  db.run(
+    "INSERT INTO transcription_history (id, file_name, timestamp, title, transcription_text, status) VALUES (1, 'a.wav', 1, 't', '', 'transcribing')",
+  );
+  expect(searchSessions(db, "fatturato", 10)).toEqual([]);
+  db.run(
+    "UPDATE transcription_history SET transcription_text = 'il fatturato cresce' WHERE id = 1",
+  );
+  expect(searchSessions(db, "fatturato", 10).map((h) => h.id)).toEqual([1]);
+  db.run("DELETE FROM transcription_history WHERE id = 1");
+  expect(searchSessions(db, "fatturato", 10)).toEqual([]);
+});
+
 test("empty database returns [] / null without throwing", () => {
   const db = createDb();
   expect(listSessions(db, 20, 0)).toEqual([]);
@@ -171,9 +219,17 @@ test("timestamp is passed through unconverted, in SECONDS", () => {
 test("defaultDbPath follows the Tauri app_data_dir on macOS and Windows", () => {
   const home = require("os").homedir();
   expect(defaultDbPath("darwin", {})).toBe(
-    join(home, "Library", "Application Support", "com.uppify.plaudy", "history.db"),
+    join(
+      home,
+      "Library",
+      "Application Support",
+      "com.uppify.plaudy",
+      "history.db",
+    ),
   );
-  expect(defaultDbPath("win32", { APPDATA: "C:\Users\me\AppData\Roaming" })).toBe(
+  expect(
+    defaultDbPath("win32", { APPDATA: "C:\Users\me\AppData\Roaming" }),
+  ).toBe(
     join("C:\Users\me\AppData\Roaming", "com.uppify.plaudy", "history.db"),
   );
   // No APPDATA (unusual service context): fall back to the conventional Roaming dir.

@@ -38,6 +38,8 @@ export const DetailPane: React.FC<{
   const hasTranscription = entry.transcription_text.trim().length > 0;
   const hasSegments = segments.length > 0;
   const transcribing = retrying || isTranscribing(entry);
+  // DATA-001: retention removed the WAV; the transcript stays, playback and re-transcribe can't.
+  const audioPurged = entry.audio_purged_at != null;
   const SourceIcon = SOURCE_ICON[source];
   const formattedDate = formatDateTime(String(entry.timestamp), i18n.language);
   const title = deriveTitle(entry, formattedDate);
@@ -146,11 +148,17 @@ export const DetailPane: React.FC<{
         {/* Keyed per entry so switching recordings remounts the player: the cached
             audio src can't leak under another entry's transcript, and unmount
             revokes any blob URL. */}
-        <AudioPlayer
-          key={entry.id}
-          onLoadRequest={handleLoadAudio}
-          className="min-w-0 flex-1"
-        />
+        {audioPurged ? (
+          <p className="min-w-0 flex-1 text-xs text-text/50">
+            {t("settings.history.audioPurged")}
+          </p>
+        ) : (
+          <AudioPlayer
+            key={entry.id}
+            onLoadRequest={handleLoadAudio}
+            className="min-w-0 flex-1"
+          />
+        )}
         <div className="flex items-center">
           <IconButton
             onClick={handleCopyText}
@@ -165,7 +173,7 @@ export const DetailPane: React.FC<{
           </IconButton>
           <IconButton
             onClick={handleRetranscribe}
-            disabled={transcribing}
+            disabled={transcribing || audioPurged}
             title={t("settings.history.retranscribe")}
           >
             <RotateCcw

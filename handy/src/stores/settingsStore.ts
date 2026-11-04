@@ -7,6 +7,7 @@ import type {
   TranscribeAcceleratorSetting,
   OrtAcceleratorSetting,
   ModelUnloadTimeout,
+  SessionAudioRetention,
 } from "@/bindings";
 import { commands } from "@/bindings";
 
@@ -120,6 +121,8 @@ const settingUpdaters: {
     ),
   recording_retention_period: (value) =>
     commands.updateRecordingRetentionPeriod(value as string),
+  session_audio_retention: (value) =>
+    commands.updateSessionAudioRetention(value as SessionAudioRetention),
   translate_to_english: (value) =>
     commands.changeTranslateToEnglishSetting(value as boolean),
   selected_language: (value) =>

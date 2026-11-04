@@ -33,10 +33,53 @@ const SCHEMA = `
   );
 `;
 
-/** A writable DB with the app schema — in-memory by default, or a file path for the spawned-server tests. */
-export function createDb(path = ":memory:"): Database {
+// DATA-002 migration, copied from history.rs (keep in sync by hand, like SCHEMA above).
+const FTS_SCHEMA = `
+  CREATE VIRTUAL TABLE history_fts USING fts5(
+    title, transcription_text,
+    content='transcription_history', content_rowid='id', tokenize='trigram'
+  );
+  CREATE TRIGGER history_fts_ai AFTER INSERT ON transcription_history BEGIN
+    INSERT INTO history_fts(rowid, title, transcription_text)
+    VALUES (new.id, new.title, new.transcription_text);
+  END;
+  CREATE TRIGGER history_fts_ad AFTER DELETE ON transcription_history BEGIN
+    INSERT INTO history_fts(history_fts, rowid, title, transcription_text)
+    VALUES ('delete', old.id, old.title, old.transcription_text);
+  END;
+  CREATE TRIGGER history_fts_au
+  AFTER UPDATE OF title, transcription_text ON transcription_history BEGIN
+    INSERT INTO history_fts(history_fts, rowid, title, transcription_text)
+    VALUES ('delete', old.id, old.title, old.transcription_text);
+    INSERT INTO history_fts(rowid, title, transcription_text)
+    VALUES (new.id, new.title, new.transcription_text);
+  END;
+  CREATE VIRTUAL TABLE segments_fts USING fts5(
+    text, content='transcription_segments', content_rowid='id', tokenize='trigram'
+  );
+  CREATE TRIGGER segments_fts_ai AFTER INSERT ON transcription_segments BEGIN
+    INSERT INTO segments_fts(rowid, text) VALUES (new.id, new.text);
+  END;
+  CREATE TRIGGER segments_fts_ad AFTER DELETE ON transcription_segments BEGIN
+    INSERT INTO segments_fts(segments_fts, rowid, text) VALUES ('delete', old.id, old.text);
+  END;
+  CREATE TRIGGER segments_fts_au AFTER UPDATE OF text ON transcription_segments BEGIN
+    INSERT INTO segments_fts(segments_fts, rowid, text) VALUES ('delete', old.id, old.text);
+    INSERT INTO segments_fts(rowid, text) VALUES (new.id, new.text);
+  END;
+`;
+
+/**
+ * A writable DB with the app schema — in-memory by default, or a file path for the
+ * spawned-server tests. `fts: false` gives a DB from before the DATA-002 migration.
+ */
+export function createDb(
+  path = ":memory:",
+  { fts = true }: { fts?: boolean } = {},
+): Database {
   const db = new Database(path);
   db.run(SCHEMA);
+  if (fts) db.run(FTS_SCHEMA);
   return db;
 }
 

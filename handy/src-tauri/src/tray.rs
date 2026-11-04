@@ -727,6 +727,7 @@ mod tests {
             post_process_requested: false,
             status: TranscriptionStatus::Done,
             source: EntrySource::Dictation,
+            audio_purged_at: None,
         }
     }
 

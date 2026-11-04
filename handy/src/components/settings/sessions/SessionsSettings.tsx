@@ -3,9 +3,19 @@ import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
 import { Mic, Square, Users, AudioLines } from "lucide-react";
 import { commands, events } from "@/bindings";
+import type { SessionAudioRetention } from "@/bindings";
 import { formatClock } from "@/utils/formatClock";
 import { useSettings } from "../../../hooks/useSettings";
 import { ToggleSwitch } from "../../ui/ToggleSwitch";
+import { Dropdown } from "../../ui/Dropdown";
+import { SettingContainer } from "../../ui/SettingContainer";
+
+const AUDIO_RETENTION: SessionAudioRetention[] = [
+  "days7",
+  "days30",
+  "days90",
+  "forever",
+];
 
 /**
  * Sessions — the "graffetta" capture experience. One tap records a meeting (your mic + this
@@ -229,6 +239,32 @@ export function SessionsSettings() {
               grouped={true}
             />
           )}
+        </div>
+
+        {/* DATA-001: transcripts are kept forever; only the (large) audio ages out, and only
+            once its transcript is done. Applied immediately by the backend. */}
+        <div className="glass-panel w-full max-w-md px-4 py-1">
+          <SettingContainer
+            title={t("settings.sessions.audioRetention.title")}
+            description={t("settings.sessions.audioRetention.description")}
+            descriptionMode="tooltip"
+            grouped={true}
+          >
+            <Dropdown
+              options={AUDIO_RETENTION.map((value) => ({
+                value,
+                label: t(`settings.sessions.audioRetention.${value}`),
+              }))}
+              selectedValue={getSetting("session_audio_retention") ?? "days7"}
+              onSelect={(value) =>
+                updateSetting(
+                  "session_audio_retention",
+                  value as SessionAudioRetention,
+                )
+              }
+              disabled={isUpdating("session_audio_retention")}
+            />
+          </SettingContainer>
         </div>
       </div>
 

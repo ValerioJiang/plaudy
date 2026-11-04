@@ -511,3 +511,22 @@ pub async fn update_recording_retention_period(
 
     Ok(())
 }
+
+/// How long meeting/session audio is kept once transcribed (DATA-001). Applies immediately:
+/// shortening the period purges what is now past it.
+#[tauri::command]
+#[specta::specta]
+pub async fn update_session_audio_retention(
+    app: AppHandle,
+    history_manager: State<'_, Arc<HistoryManager>>,
+    retention: crate::settings::SessionAudioRetention,
+) -> Result<(), String> {
+    let mut settings = crate::settings::get_settings(&app);
+    settings.session_audio_retention = retention;
+    crate::settings::write_settings(&app, settings);
+
+    history_manager
+        .purge_session_audio()
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}

@@ -172,6 +172,36 @@ pub enum AutoSubmitKey {
     CmdEnter,
 }
 
+/// How long a long-form session's audio (meeting, mic or system recording) is kept once its
+/// transcript is done (DATA-001). The transcript, speakers and segments are never deleted by
+/// retention; only the WAV goes. Failed or pending transcripts keep their audio at any age.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Type)]
+#[serde(rename_all = "snake_case")]
+// Explicit names: serde's snake_case gives "days7" while specta's gives "days_7"; pinning
+// them keeps the TS type and the wire format identical.
+pub enum SessionAudioRetention {
+    #[serde(rename = "days7")]
+    Days7,
+    #[serde(rename = "days30")]
+    Days30,
+    #[serde(rename = "days90")]
+    Days90,
+    #[serde(rename = "forever")]
+    Forever,
+}
+
+impl SessionAudioRetention {
+    /// Age in days after which the audio may go; `None` = keep forever.
+    pub fn days(self) -> Option<i64> {
+        match self {
+            Self::Days7 => Some(7),
+            Self::Days30 => Some(30),
+            Self::Days90 => Some(90),
+            Self::Forever => None,
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Type)]
 #[serde(rename_all = "snake_case")]
 pub enum RecordingRetentionPeriod {
@@ -415,6 +445,8 @@ pub struct AppSettings {
     pub history_limit: usize,
     #[serde(default = "default_recording_retention_period")]
     pub recording_retention_period: RecordingRetentionPeriod,
+    #[serde(default = "default_session_audio_retention")]
+    pub session_audio_retention: SessionAudioRetention,
     #[serde(default)]
     pub paste_method: PasteMethod,
     #[serde(default)]
@@ -600,6 +632,12 @@ fn default_history_limit() -> usize {
 
 fn default_recording_retention_period() -> RecordingRetentionPeriod {
     RecordingRetentionPeriod::PreserveLimit
+}
+
+/// 7 days: the PM pick on the consent/retention item (PO request 2026-11-04). Enough to
+/// re-listen to last week's meetings; ~115 MB per meeting-hour is not kept forever by default.
+fn default_session_audio_retention() -> SessionAudioRetention {
+    SessionAudioRetention::Days7
 }
 
 fn default_audio_feedback_volume() -> f32 {
@@ -923,6 +961,7 @@ pub fn get_default_settings() -> AppSettings {
         word_correction_threshold: default_word_correction_threshold(),
         history_limit: default_history_limit(),
         recording_retention_period: default_recording_retention_period(),
+        session_audio_retention: default_session_audio_retention(),
         paste_method: PasteMethod::default(),
         clipboard_handling: ClipboardHandling::default(),
         auto_submit: default_auto_submit(),

@@ -445,6 +445,7 @@
       "loading": "Caricamento cronologia...",
       "empty": "Non ci sono ancora trascrizioni. Comincia a registrare per costruire la tua cronologia!",
       "copyToClipboard": "Copia la trascrizione negli appunti",
+      "audioPurged": "Audio eliminato dopo il periodo di conservazione. La trascrizione resta.",
       "save": "Salva la trascrizione",
       "unsave": "Rimuovi dai salvataggi",
       "delete": "Elimina elemento",
@@ -639,6 +640,14 @@
       "capturingMic": "Sto catturando il microfono",
       "capturingSystem": "Sto catturando l'audio di sistema",
       "privacyNote": "Registra il tuo microfono e l'audio di questo Mac come due flussi, separati per interlocutore. Niente lascia mai il tuo Mac.",
+      "audioRetention": {
+        "title": "Conserva l'audio delle riunioni",
+        "description": "Le registrazioni vengono eliminate dopo questo periodo, quando la trascrizione è pronta. Trascrizioni, interlocutori e sessioni con la stella restano sempre.",
+        "days7": "7 giorni",
+        "days30": "30 giorni",
+        "days90": "90 giorni",
+        "forever": "Per sempre"
+      },
       "autoCapture": {
         "title": "Cattura automatica",
         "description": "Avvia automaticamente una sessione riunione quando un'altra app riproduce audio (una chiamata, un video) e la interrompe quando torna il silenzio. Sperimentale — tutto resta su questo Mac.",
