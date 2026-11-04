@@ -1,3 +1,16 @@
 {
-  "$schema": "https://json.schemastore.org/claude-code-settings.json"
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "hooks": {
+    "PreCompact": [
+      { "hooks": [ { "type": "command", "command": "./scripts/compact-alarm.sh" } ] }
+    ],
+    "SessionStart": [
+      { "matcher": "compact",
+        "hooks": [ { "type": "command", "command": "cat plan/HANDOFF.md 2>/dev/null || true" } ] }
+    ],
+    "Notification": [
+      { "hooks": [ { "type": "command",
+                     "command": "./scripts/alarm.sh FYI WAITING \"Claude is waiting on you\"" } ] }
+    ]
+  }
 }

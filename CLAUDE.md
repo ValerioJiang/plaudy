@@ -76,3 +76,27 @@ cd handy && bun tauri dev                 # or: cd handy/src-tauri && cargo buil
 - **Next (for Gianni / incoming dev):** read `docs/HANDOFF-GIANNI.md`. Then: the **"Enable diarization" download button**; a **real-meeting validation** of auto-capture (then consider flipping the default); optional app-allowlist refinement of the trigger. See `docs/HANDOFF.md` §11 and `docs/HANDOFF-HARDENING.md` §3 (ranked backlog incl. Meetily-gap adoptions: audio import, Markdown export).
 - **Now a git repository:** pushed to `github.com/uppifyagency/plaudy` (private), branch `main`. The upstream `handy/.git` was flattened into this single repo. Commit/push only when asked.
 - iPhone target remains an open decision — Handy has **no iOS support** today (recommended path: iPhone-as-capture + Mac-as-brain; needs full Xcode, deferred).
+
+## Windows port — ADLC (PO/PM) workflow (added 2026-11-03)
+The Windows port is run with the PO/PM story framework. The user is the Product
+Owner; the `pm` agent (`.claude/agents/pm.md`) decomposes and routes; `implementer`
+and `verifier` agents execute and check stories. Read `plan/HANDOFF.md` first.
+
+- Product state for the port: `docs/adlc/PRODUCT.md`, `docs/adlc/INTERFACES.md`
+  (IF-W01..W04), `docs/adlc/DECISIONS.md` (ADR-001..), `docs/adlc/RISKS.md`,
+  `docs/adlc/ROUTING.md`. The older `docs/DECISIONS.md` is the riffado ledger
+  from the macOS work and is untouched.
+- Status table: `plan/BACKLOG.md`. Specs: `plan/stories/<ID>.md` (+ `.worklog.md`).
+  Verdicts: `plan/reviews/<ID>.md`. Alarms: `./scripts/alarm.sh` -> `plan/ATTENTION.md`.
+- One story = one branch = one worktree (`../plaudy-<ID>`) = one PR. Branch name is
+  the story ID; every commit message starts with it; commit per acceptance criterion.
+- Scaffold a story: `scripts/new-story.sh <ID> "<title>"`. Reconcile backlog vs git:
+  `scripts/status.sh`.
+- House rules: no new crate or npm dependency without an ADR in
+  `docs/adlc/DECISIONS.md`; tests in the same commit as the code; if a spec is
+  ambiguous, stop and raise `STOP SPEC-AMBIGUOUS`, do not guess. Never regress the
+  macOS build: `cargo test --lib` and `scripts/verify-bundle.sh` must stay green there.
+- Windows build prerequisites: VS Build Tools 18 (VS 2026, MSVC 14.50; any 2022+
+  works), Rust (rustup), Bun, Vulkan SDK (`winget install KhronosGroup.VulkanSDK`),
+  CMake; see `handy/BUILD.md`. Shells opened before the installs lack Bun and
+  `VULKAN_SDK` on PATH: `export PATH="$HOME/.cargo/bin:$LOCALAPPDATA/Microsoft/WinGet/Links:/c/VulkanSDK/1.4.363.0/Bin:$PATH"`.
