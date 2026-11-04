@@ -3,7 +3,13 @@ import { Database } from "bun:sqlite";
 import { mkdtempSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
-import { listSessions, getSession, searchSessions, openDb } from "./db";
+import {
+  listSessions,
+  getSession,
+  searchSessions,
+  openDb,
+  defaultDbPath,
+} from "./db";
 import { createDb, seedSessions } from "./fixture";
 
 function seed(): Database {
@@ -159,4 +165,24 @@ test("timestamp is passed through unconverted, in SECONDS", () => {
   expect(getSession(db, 1)!.timestamp).toBe(epochSeconds);
   // Pin the unit: a milliseconds migration (~1.7e12) must break this assert loudly.
   expect(row.timestamp).toBeLessThan(1e11);
+});
+
+// IF-W04: the server must find history.db where the Tauri app writes it on each platform.
+test("defaultDbPath follows the Tauri app_data_dir on macOS and Windows", () => {
+  const home = require("os").homedir();
+  expect(defaultDbPath("darwin", {})).toBe(
+    join(home, "Library", "Application Support", "com.uppify.plaudy", "history.db"),
+  );
+  expect(defaultDbPath("win32", { APPDATA: "C:\Users\me\AppData\Roaming" })).toBe(
+    join("C:\Users\me\AppData\Roaming", "com.uppify.plaudy", "history.db"),
+  );
+  // No APPDATA (unusual service context): fall back to the conventional Roaming dir.
+  expect(defaultDbPath("win32", {})).toBe(
+    join(home, "AppData", "Roaming", "com.uppify.plaudy", "history.db"),
+  );
+});
+
+test("PLAUDE_DB overrides the platform default", () => {
+  expect(defaultDbPath("win32", { PLAUDE_DB: "/tmp/x.db" })).toBe("/tmp/x.db");
+  expect(defaultDbPath("darwin", { PLAUDE_DB: "/tmp/x.db" })).toBe("/tmp/x.db");
 });

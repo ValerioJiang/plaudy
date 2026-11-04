@@ -1,4 +1,6 @@
 fn main() {
+    emit_system_audio_cfg();
+
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     build_apple_intelligence_bridge();
 
@@ -621,4 +623,26 @@ fn assert_diarization_model_staged() {
         panic!("{message}");
     }
     println!("cargo:warning={message}");
+}
+
+/// IF-W03: the one platform predicate for system-audio capture and the output sensor.
+///
+/// `cfg(system_audio)` is true where a loopback backend exists: the CoreAudio Process Tap on
+/// Apple-silicon macOS and WASAPI loopback on x86_64 Windows. The source gates on this
+/// predicate only; which backend file is compiled underneath is chosen by `target_os` in
+/// `audio_toolkit/audio/mod.rs`. Decided against `cfg(any(all(macos, aarch64), all(windows,
+/// x86_64)))` inline so that adding a platform is one line here, not an edit to every shared
+/// file (ADR-004). Target env vars come from cargo for the TARGET of the build, so this also
+/// holds under `--target` cross-checks.
+fn emit_system_audio_cfg() {
+    println!("cargo:rustc-check-cfg=cfg(system_audio)");
+    let os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    let arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
+    let supported = matches!(
+        (os.as_str(), arch.as_str()),
+        ("macos", "aarch64") | ("windows", "x86_64")
+    );
+    if supported {
+        println!("cargo:rustc-cfg=system_audio");
+    }
 }

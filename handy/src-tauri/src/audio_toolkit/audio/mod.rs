@@ -1,14 +1,25 @@
 // Re-export all audio components
 mod device;
 mod mic_sensor;
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-mod output_sensor;
 mod recorder;
 mod resampler;
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-mod system_audio;
 mod utils;
 mod visualizer;
+
+// System-audio capture and the output sensor exist on the targets where `build.rs` emits the
+// `system_audio` predicate (IF-W03: macOS aarch64, Windows x86_64). The predicate says WHETHER
+// the feature compiles; `target_os` only picks WHICH backend file provides it. Both backends
+// expose the same surface (IF-W01, IF-W02), so nothing below this block is platform-specific.
+#[cfg(all(system_audio, target_os = "macos"))]
+mod output_sensor;
+#[cfg(all(system_audio, target_os = "windows"))]
+#[path = "output_sensor_windows.rs"]
+mod output_sensor;
+#[cfg(all(system_audio, target_os = "macos"))]
+mod system_audio;
+#[cfg(all(system_audio, target_os = "windows"))]
+#[path = "system_audio_windows.rs"]
+mod system_audio;
 
 pub use device::{list_input_devices, list_output_devices, CpalDeviceInfo};
 pub use mic_sensor::MicVoiceSensor;
@@ -16,7 +27,7 @@ pub use recorder::{
     is_microphone_access_denied, is_no_input_device_error, AudioRecorder, VadPolicy,
 };
 pub use resampler::FrameResampler;
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(system_audio)]
 pub use system_audio::SystemAudioRecorder;
 pub use utils::{create_wav_writer, read_wav_samples, save_wav_file, verify_wav_file};
 pub use visualizer::AudioVisualiser;
@@ -48,13 +59,14 @@ fn gated_external(sensor: bool, playback: bool) -> bool {
 }
 
 /// Tap-free "is some OTHER app playing audio?" sensor for seamless auto-capture. On macOS aarch64
-/// it reads per-process CoreAudio output state (own PID excluded); elsewhere it never triggers.
+/// it reads per-process CoreAudio output state (own PID excluded); on Windows x86_64 the
+/// audio-session sensor; elsewhere it never triggers.
 /// Masked while WE are playing back a recording (see `PLAYBACK_ACTIVE`).
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(system_audio)]
 pub fn external_output_active() -> bool {
     gated_external(output_sensor::external_output_active(), playback_active())
 }
-#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+#[cfg(not(system_audio))]
 pub fn external_output_active() -> bool {
     false
 }

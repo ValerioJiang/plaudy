@@ -23,7 +23,7 @@
 //! models are present (Fase 2), `finalize` additionally persists per-speaker segments
 //! via [`crate::managers::diarization`] + `HistoryManager::save_segments`.
 
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(system_audio)]
 use crate::audio_toolkit::audio::SystemAudioRecorder;
 use crate::audio_toolkit::{AudioRecorder, VadPolicy};
 use crate::managers::diarization::{
@@ -202,7 +202,7 @@ impl ActivityTap {
 /// feed the same on-disk PCM sink; they differ only in the sample source.
 enum ActiveRecorder {
     Mic(AudioRecorder),
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[cfg(system_audio)]
     System(SystemAudioRecorder),
 }
 
@@ -212,7 +212,7 @@ impl ActiveRecorder {
             ActiveRecorder::Mic(r) => {
                 let _ = r.stop();
             }
-            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            #[cfg(system_audio)]
             ActiveRecorder::System(r) => {
                 let _ = r.stop();
             }
@@ -224,7 +224,7 @@ impl ActiveRecorder {
             ActiveRecorder::Mic(r) => {
                 let _ = r.close();
             }
-            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            #[cfg(system_audio)]
             ActiveRecorder::System(r) => {
                 let _ = r.close();
             }
@@ -833,7 +833,7 @@ fn build_recorder(source: Source, tx: mpsc::Sender<Vec<f32>>) -> Result<ActiveRe
                 .map_err(|e| anyhow!("start mic capture: {e}"))?;
             Ok(ActiveRecorder::Mic(r))
         }
-        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        #[cfg(system_audio)]
         Source::SystemAudio => {
             let mut r = SystemAudioRecorder::new()
                 .map_err(|e| anyhow!("create system-audio recorder: {e}"))?
@@ -845,11 +845,11 @@ fn build_recorder(source: Source, tx: mpsc::Sender<Vec<f32>>) -> Result<ActiveRe
                 .map_err(|e| anyhow!("start system-audio capture: {e}"))?;
             Ok(ActiveRecorder::System(r))
         }
-        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        #[cfg(not(system_audio))]
         Source::SystemAudio => {
             drop(tx);
             Err(anyhow!(
-                "System audio capture is only available on Apple Silicon macOS"
+                "System audio capture is not available on this platform"
             ))
         }
     }

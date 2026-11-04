@@ -6,17 +6,22 @@ import { join } from "path";
 
 /** Default location of the app's SQLite DB; override with PLAUDE_DB for tests / portability. */
 // Must match `identifier` in src-tauri/tauri.conf.json — no shared constant, keep in sync by hand.
-export function defaultDbPath(): string {
-  return (
-    process.env.PLAUDE_DB ??
-    join(
-      homedir(),
-      "Library",
-      "Application Support",
-      "com.uppify.plaudy",
-      "history.db",
-    )
-  );
+// IF-W04: Tauri's app_data_dir() for that identifier is
+//   macOS   ~/Library/Application Support/com.uppify.plaudy/
+//   Windows %APPDATA%\com.uppify.plaudy\   (APPDATA falls back to ~/AppData/Roaming)
+export function defaultDbPath(
+  platform: NodeJS.Platform = process.platform,
+  env: NodeJS.ProcessEnv = process.env,
+): string {
+  if (env.PLAUDE_DB) return env.PLAUDE_DB;
+  return join(appDataDir(platform, env), "com.uppify.plaudy", "history.db");
+}
+
+function appDataDir(platform: NodeJS.Platform, env: NodeJS.ProcessEnv): string {
+  if (platform === "win32") {
+    return env.APPDATA ?? join(homedir(), "AppData", "Roaming");
+  }
+  return join(homedir(), "Library", "Application Support");
 }
 
 /**
