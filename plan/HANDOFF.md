@@ -34,9 +34,9 @@ build --debug --no-bundle` or plain `cargo build` in `handy/src-tauri`
 PowerShell, not Git Bash.
 
 ## Wave in progress
-Wave 1 is open. WIN-CAP-001 done ahead of the parallel plan; WIN-SENSE-001
-(real Windows sensor; stub is inert) and WIN-BUILD-001 (NSIS, DLLs, MCP
-path, BUILD.md) remain spec'd and untouched. Their shared files are frozen.
+Wave 1 is open. WIN-CAP-001, WIN-CAP-003, DIAR-W01 and WIN-SENSE-001 done;
+WIN-BUILD-001 (NSIS, DLLs, MCP path, BUILD.md) remains spec'd and
+untouched. Its shared files are frozen.
 
 ## Decided since last handoff
 None by the PO. Implementer choices worth a glance: no silent render stream
@@ -70,8 +70,27 @@ recipes.
    files: commit by path, two commits). Sortformer finds 2 speakers on a
    two-voice WAV on Windows via Vulkan; the E2E Meeting captured three
    endpoints including the WH-1000XM4 with mic and system tracks of
-   identical length. PM: next are WIN-SENSE-001 and WIN-BUILD-001 in
-   parallel worktrees.
+   identical length. Both committed and merged to main (f3ba71e).
+5. WIN-SENSE-001 done and self-reported on branch `WIN-SENSE-001`
+   (uncommitted at hand-off): real WASAPI audio-session sensor, every
+   active render endpoint, own PID excluded, peak-meter gated (0.001).
+   PowerShell tada.wav triggers in 322 ms; the soak found a ~2 KB/tick leak
+   from per-call COM teardown, fixed with a thread-held COM init; 10-minute
+   4 Hz soak then flat.
+   Deviation from the spec text (all endpoints, not default) is a DECIDE
+   in ATTENTION. PO still owes: silent-machine run, supervisor E2E on a
+   Teams test call, Chrome-silent-tab check (recipes in the worklog). The
+   supervisor E2E was deliberately not run from the session because Teams
+   was open and Chrome was playing on the laptop.
+6. DATA-001 (meeting audio retention) and DATA-002 (FTS5 trigram search
+   index) done and self-reported in the same uncommitted tree, branch
+   `WIN-SENSE-001`. Commit by path in this order: WIN-SENSE-001, DATA-001,
+   DATA-002 (`history.rs` is shared by the two DATA stories; migration #8 is
+   DATA-001's, #9 DATA-002's). Old retention deleted whole meeting rows after
+   5; now sessions are never deleted, only their audio after 7 days once
+   transcribed. The laptop DB is already migrated to version 9 by the debug
+   launches that regenerated `bindings.ts`. PM: next is WIN-BUILD-001, then
+   EVAL-W01.
 
 ## Known unknowns
 Which Vulkan device `Auto` picks at model load (RTX vs iGPU); loopback

@@ -74,6 +74,8 @@ flowchart LR
 
 The key design insight: **mic and system audio feed the *same* consumer** through a producer-agnostic `chunk_sink`, so there's no parallel pipeline — any future source just emits samples. Everything downstream (mix → diarize → transcribe → merge → speaker timeline) is shared. Deep dive: **[docs/CODEBASE.md](docs/CODEBASE.md)**.
 
+Windows support, auto-capture, what is stored, what retention deletes and how search works, in five simple diagrams: **[docs/HOW-IT-WORKS.md](docs/HOW-IT-WORKS.md)**.
+
 ---
 
 ## Quick start
