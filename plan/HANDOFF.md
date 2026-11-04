@@ -46,7 +46,7 @@ injected `platform`/`env` parameters instead of mocking `process.platform`.
 
 ## Interfaces frozen since last handoff
 IF-W01, IF-W02, IF-W03, IF-W04 (2026-11-04). Diarization gates are NOT under
-IF-W03 (new attention item).
+IF-W03; DIAR-W01 removed them from the Sortformer path instead.
 
 ## Open questions for the Product Owner
 See `plan/ATTENTION.md`. New this session: ungate Sortformer diarization
@@ -64,9 +64,14 @@ recipes.
    with the Meeting button, then run the WIN-CAP-001 alignment recipe and the
    BASELINE §9 recipes in one sitting.
 3. PO on the Mac: FRZ-W01 regression block.
-4. PM: spec a small story for the diarization gate (B in BASELINE §10), then
-   WIN-SENSE-001 and WIN-BUILD-001 in parallel worktrees now that files can
-   be committed.
+4. DIAR-W01 (diarization gate) and WIN-CAP-003 (every active render
+   endpoint, earphones/Bluetooth, device rescan) are done and self-reported,
+   both uncommitted in the main checkout on branch `DIAR-W01` (disjoint
+   files: commit by path, two commits). Sortformer finds 2 speakers on a
+   two-voice WAV on Windows via Vulkan; the E2E Meeting captured three
+   endpoints including the WH-1000XM4 with mic and system tracks of
+   identical length. PM: next are WIN-SENSE-001 and WIN-BUILD-001 in
+   parallel worktrees.
 
 ## Known unknowns
 Which Vulkan device `Auto` picks at model load (RTX vs iGPU); loopback

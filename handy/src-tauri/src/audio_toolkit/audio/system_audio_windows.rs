@@ -1,32 +1,40 @@
-//! Windows system-audio (loopback) capture producer (IF-W01, WIN-CAP-001).
+//! Windows system-audio (loopback) capture producer (IF-W01, WIN-CAP-001 + WIN-CAP-003).
 //!
-//! Captures everything the default render endpoint plays (the remote side of a Teams or Meet
-//! call, through headset or speakers alike) with a WASAPI shared-mode **loopback** stream, and
-//! feeds it into the same `run_consumer` pipeline as the microphone `AudioRecorder` and the macOS
-//! Process Tap. The only platform-specific part is the sample source: a capture thread that
-//! waits on the WASAPI event, drains `IAudioCaptureClient`, converts the endpoint's mix format
-//! to mono f32 and hands chunks to the consumer. Everything downstream (resampling to 16 kHz,
-//! chunk sink to the PCM writer, mix, finalize, diarization) is shared and untouched.
+//! Captures everything Windows plays, whatever it plays it through, with WASAPI shared-mode
+//! **loopback** streams, and feeds the sum into the same `run_consumer` pipeline as the
+//! microphone `AudioRecorder` and the macOS Process Tap. Everything downstream (chunk sink to
+//! the PCM writer, mix, finalize, diarization) is shared and untouched.
 //!
-//! Two Windows facts shape the design:
+//! Why *every* active render endpoint and not "the default device" (WIN-CAP-003): a call does
+//! not necessarily play through the default device. Bluetooth earphones expose a second
+//! "Hands-Free" endpoint that Teams and Meet switch to for calls, Windows keeps a separate
+//! *communications* default, and plugging earphones in mid-meeting moves the audio to a device
+//! that did not exist when the session started. So the recorder:
 //!
-//! 1. **Silence stops the clock.** A loopback stream only delivers packets while *something*
-//!    renders; when every app goes quiet, WASAPI delivers nothing and (on some drivers) never
-//!    signals the event either. A naive capture would then produce a WAV shorter than the
-//!    meeting, and the mic track and the system track would drift apart (risk R1). The capture
-//!    thread therefore keeps its own monotonic clock and inserts zero frames whenever the
-//!    emitted frame count falls behind wall time (`gap_fill_frames`), so total length ==
-//!    elapsed time within a buffer period. The event wait has a short timeout for the same
-//!    reason: the loop must run even when WASAPI is mute.
-//! 2. **COM lives on one thread.** Every COM object is created, used and released on the
-//!    capture thread (MTA). `open()` only waits for that thread's init result. That keeps
-//!    `SystemAudioRecorder` trivially `Send` (it owns channels and join handles, no COM
-//!    pointers), which `SessionManager` requires.
+//! * opens one loopback per active render endpoint (`EnumAudioEndpoints(eRender, ACTIVE)`),
+//!   each on its own thread with its own COM apartment, converted to mono and resampled to
+//!   16 kHz right there (endpoints run at different rates: 48 kHz speakers, 16 kHz hands-free);
+//! * rescans the endpoint list every two seconds, starting captures for new devices and
+//!   retiring ones that vanished or whose stream was invalidated;
+//! * mixes the per-endpoint streams on a master clock and hands 16 kHz mono chunks to the
+//!   consumer. Only one endpoint carries the call at any moment, so the sum is the call.
+//!
+//! Two Windows facts shape the per-endpoint loop:
+//!
+//! 1. **Silence stops the clock.** A loopback stream only delivers packets while something
+//!    renders to that endpoint; when it goes quiet WASAPI delivers nothing and may not signal
+//!    the event either. Each endpoint thread keeps a monotonic clock and inserts zero frames
+//!    whenever its emitted count falls behind wall time (`gap_fill_frames`), so every stream,
+//!    and therefore the mix, keeps wall-clock length and stays aligned with the mic track (R1).
+//! 2. **COM lives on one thread.** Every COM object is created, used and released on the thread
+//!    that owns it. `SystemAudioRecorder` holds only channels and join handles, so it is
+//!    trivially `Send`, which `SessionManager` requires.
 //!
 //! All `unsafe` FFI is confined to this file behind the safe `SystemAudioRecorder` API.
 #![cfg(all(target_os = "windows", target_arch = "x86_64"))]
 #![allow(dead_code)]
 
+use std::collections::VecDeque;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     mpsc, Arc,
@@ -34,20 +42,22 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 use windows::core::{GUID, PCWSTR};
+use windows::Win32::Devices::FunctionDiscovery::PKEY_Device_FriendlyName;
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::Media::Audio::{
-    eConsole, eRender, IAudioCaptureClient, IAudioClient, IMMDevice, IMMDeviceEnumerator,
-    MMDeviceEnumerator, AUDCLNT_BUFFERFLAGS_SILENT, AUDCLNT_E_DEVICE_INVALIDATED,
-    AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_EVENTCALLBACK, AUDCLNT_STREAMFLAGS_LOOPBACK,
+    eRender, IAudioCaptureClient, IAudioClient, IMMDevice, IMMDeviceEnumerator,
+    MMDeviceEnumerator, AUDCLNT_BUFFERFLAGS_SILENT, AUDCLNT_SHAREMODE_SHARED,
+    AUDCLNT_STREAMFLAGS_EVENTCALLBACK, AUDCLNT_STREAMFLAGS_LOOPBACK, DEVICE_STATE_ACTIVE,
     WAVEFORMATEX, WAVEFORMATEXTENSIBLE,
 };
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize, CLSCTX_ALL,
-    COINIT_MULTITHREADED,
+    COINIT_MULTITHREADED, STGM_READ,
 };
 use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
 
 use super::recorder::{run_consumer, AudioChunk, Cmd, FrameSinks, VadPolicy};
+use super::resampler::FrameResampler;
 
 // ---------------------------------------------------------------------------------------------
 // Pure helpers (unit-tested without COM)
@@ -64,7 +74,7 @@ const KSDATAFORMAT_SUBTYPE_PCM: GUID = GUID::from_u128(0x00000001_0000_0010_8000
 const KSDATAFORMAT_SUBTYPE_IEEE_FLOAT: GUID =
     GUID::from_u128(0x00000003_0000_0010_8000_00aa00389b71);
 
-/// How one sample is laid out in the endpoint's mix format. Shared-mode Windows mixes in 32-bit
+/// How one sample is laid out in an endpoint's mix format. Shared-mode Windows mixes in 32-bit
 /// float practically everywhere, but the API allows integer PCM and the spec asks for it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SampleFormat {
@@ -77,7 +87,7 @@ pub(crate) enum SampleFormat {
     I32,
 }
 
-/// The facts about the mix format the capture loop needs, extracted once at `open()`.
+/// The facts about a mix format the capture loop needs, extracted once per endpoint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct StreamFormat {
     pub sample_rate: u32,
@@ -167,14 +177,14 @@ pub(crate) fn bytes_to_mono_f32(bytes: &[u8], fmt: &StreamFormat, out: &mut Vec<
     }
 }
 
-/// Clock discipline for the loopback stream (R1). `expected` is how many frames wall time says
+/// Clock discipline for one loopback stream (R1). `expected` is how many frames wall time says
 /// should have been emitted since the stream started; `emitted` is how many were (real plus
 /// zero). Returns the number of zero frames to insert *now*:
 ///
 /// * `0` while the deficit is below `min_gap` — real packets arrive in bursts up to one buffer
 ///   period late, and filling inside that window would interleave zeros with real audio;
 /// * the whole deficit once it exceeds `min_gap` — the renderer went quiet, catch up to the
-///   clock so the WAV keeps wall-clock length and the mic track stays aligned;
+///   clock so the stream keeps wall-clock length;
 /// * `0` when emitted is ahead of the clock (the device clock runs slightly fast): frames are
 ///   never dropped, a few ms of lead is harmless and self-corrects at the next silence.
 pub(crate) fn gap_fill_frames(expected: u64, emitted: u64, min_gap: u64) -> u64 {
@@ -186,21 +196,66 @@ pub(crate) fn gap_fill_frames(expected: u64, emitted: u64, min_gap: u64) -> u64 
     }
 }
 
-/// Deficit beyond which the clock is re-based instead of filled: the machine slept, or the
-/// thread was starved for a very long time. Filling minutes of zeros would make the system
-/// track *longer* than the mic track (whose cpal stream simply stopped), so re-sync instead
-/// and log it; the session's own sleep-wake handling owns that case.
+/// Mix the next `n` samples of every endpoint stream into one chunk. Each queue contributes
+/// what it has (up to `n`) and is zero-padded for the rest, so a dead or late endpoint never
+/// stalls the mix; the sum is clamped to [-1, 1]. A queue that has piled up more than
+/// `max_backlog` samples beyond what was taken is trimmed from the front: that endpoint has
+/// drifted ahead of the master clock (or its thread was starved and then caught up at once) and
+/// keeping the excess would delay it forever. Pure, unit-tested.
+pub(crate) fn mix_next(queues: &mut [VecDeque<f32>], n: usize, max_backlog: usize) -> Vec<f32> {
+    let mut out = vec![0.0f32; n];
+    for q in queues.iter_mut() {
+        let take = n.min(q.len());
+        for (o, s) in out.iter_mut().zip(q.drain(..take)) {
+            *o += s;
+        }
+        if q.len() > max_backlog {
+            let excess = q.len() - max_backlog;
+            q.drain(..excess);
+        }
+    }
+    for o in &mut out {
+        *o = o.clamp(-1.0, 1.0);
+    }
+    out
+}
+
+/// The rate every endpoint stream is converted to before mixing, and the rate the consumer is
+/// told. Matches the pipeline's native 16 kHz so `run_consumer`'s resampler is a pass-through.
+const MIX_RATE: u32 = 16_000;
+
+/// How far behind wall clock the mixer runs. Endpoint streams arrive late by one WASAPI period
+/// (10 ms), one resampler chunk (1024 input samples: 21 ms at 48 kHz, none at 16 kHz), one 30 ms
+/// resampler frame and up to one tick (20 ms): about 80 ms for the usual endpoints. The mixer
+/// waits this long so a healthy endpoint always has the samples it asks for; the price is that
+/// the system track trails the mic track by about this much (the consumer starts taking chunks
+/// at `Cmd::Start`, and the chunks are this old). An endpoint slower than this (an 8 kHz
+/// narrowband hands-free profile resamples in 128 ms chunks) is padded with zeros once and then
+/// runs that much later; its audio is still complete. Kept at 100 ms as the balance between
+/// those two costs; measured mic-vs-system offset is in the WIN-CAP-003 worklog.
+const MIX_LATENCY: Duration = Duration::from_millis(100);
+
+/// Per-endpoint backlog tolerated beyond the mixer's demand before trimming (see [`mix_next`]).
+const MAX_BACKLOG: Duration = Duration::from_secs(1);
+
+/// How often the coordinator re-enumerates active render endpoints (earphones plugged in,
+/// Bluetooth hands-free profile activated by a call, a device unplugged).
+const RESCAN_EVERY: Duration = Duration::from_secs(2);
+
+/// Deficit beyond which a clock is re-based instead of filled: the machine slept, or a thread
+/// was starved for a very long time. Filling minutes of zeros would make the system track
+/// *longer* than the mic track (whose cpal stream simply stopped), so re-sync and log instead.
 const RESYNC_AFTER: Duration = Duration::from_secs(10);
 
-/// Below this deficit the loop does not fill (see [`gap_fill_frames`]). Two default WASAPI
-/// periods (10 ms each) plus margin: long enough that bursty delivery never triggers it,
-/// short enough that the first real packet after a silence lands at most this late.
+/// Below this deficit an endpoint loop does not fill (see [`gap_fill_frames`]). Two default
+/// WASAPI periods (10 ms each) plus margin.
 const MIN_GAP: Duration = Duration::from_millis(50);
 
-/// How long the capture loop waits for the WASAPI event before running a clock check anyway.
-const EVENT_WAIT: Duration = Duration::from_millis(20);
+/// How long an endpoint loop waits for its WASAPI event before running a clock check anyway,
+/// and the mixer's tick.
+const TICK: Duration = Duration::from_millis(20);
 
-/// Shared-mode buffer the endpoint keeps for us, in 100 ns units (200 ms). Generous so a busy
+/// Shared-mode buffer each endpoint keeps for us, in 100 ns units (200 ms). Generous so a busy
 /// UI thread cannot overflow it; latency is irrelevant for a recording.
 const BUFFER_DURATION_HNS: i64 = 2_000_000;
 
@@ -212,14 +267,15 @@ pub struct SystemAudioRecorder {
     cmd_tx: Option<mpsc::Sender<Cmd>>,
     /// The shared `run_consumer` worker (resample + sinks), same as the mic path.
     worker_handle: Option<std::thread::JoinHandle<()>>,
-    /// The WASAPI capture thread; owns every COM object.
-    capture_handle: Option<std::thread::JoinHandle<()>>,
+    /// The coordinator thread: enumerates endpoints, owns the per-endpoint capture threads,
+    /// mixes their streams on the master clock.
+    coordinator_handle: Option<std::thread::JoinHandle<()>>,
     level_cb: Option<Arc<dyn Fn(Vec<f32>) + Send + Sync + 'static>>,
     chunk_sink: Option<mpsc::Sender<Vec<f32>>>,
     /// Shared with `run_consumer`: true between `Cmd::Stop` and the next `Cmd::Start`, when the
     /// producer must send `EndOfStream` once and otherwise stay quiet.
     stop_flag: Arc<AtomicBool>,
-    /// Tells the capture thread to tear down. Set by `close()` only.
+    /// Tells the coordinator (and through it every endpoint thread) to tear down. `close()` only.
     quit: Arc<AtomicBool>,
 }
 
@@ -228,7 +284,7 @@ impl SystemAudioRecorder {
         Ok(SystemAudioRecorder {
             cmd_tx: None,
             worker_handle: None,
-            capture_handle: None,
+            coordinator_handle: None,
             level_cb: None,
             chunk_sink: None,
             stop_flag: Arc::new(AtomicBool::new(false)),
@@ -249,9 +305,10 @@ impl SystemAudioRecorder {
         self
     }
 
-    /// Open the loopback stream on the default render endpoint and start the two threads.
-    /// Returns the endpoint's error verbatim when WASAPI refuses (no render device, exclusive
-    /// mode held by another app, ...). Idempotent while open.
+    /// Start the coordinator (which opens a loopback on every active render endpoint) and the
+    /// consumer. Fails only when WASAPI itself cannot be reached (COM or the device enumerator);
+    /// a machine with no active output device opens fine and records silence, so the mic track
+    /// of the meeting is never lost over the system track. Idempotent while open.
     pub fn open(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         if self.worker_handle.is_some() {
             return Ok(()); // already open
@@ -259,43 +316,40 @@ impl SystemAudioRecorder {
 
         let (sample_tx, sample_rx) = mpsc::channel::<AudioChunk>();
         let (cmd_tx, cmd_rx) = mpsc::channel::<Cmd>();
-        let (init_tx, init_rx) = mpsc::channel::<Result<u32, String>>();
+        let (init_tx, init_rx) = mpsc::channel::<Result<(), String>>();
 
         let stop_flag = Arc::new(AtomicBool::new(false));
         let quit = Arc::new(AtomicBool::new(false));
         self.stop_flag = stop_flag.clone();
         self.quit = quit.clone();
 
-        // 1. Capture thread: all COM work happens here. It reports the sample rate (or the
-        //    init error) once, then runs until `quit`.
-        let capture = std::thread::Builder::new()
-            .name("plaudy-wasapi-loopback".into())
+        let coordinator = std::thread::Builder::new()
+            .name("plaudy-wasapi-mixer".into())
             .spawn({
                 let stop_flag = stop_flag.clone();
                 let quit = quit.clone();
-                move || capture_thread(init_tx, sample_tx, stop_flag, quit)
+                move || coordinator_thread(init_tx, sample_tx, stop_flag, quit)
             })?;
 
-        let sample_rate = match init_rx.recv() {
-            Ok(Ok(rate)) => rate,
+        match init_rx.recv() {
+            Ok(Ok(())) => {}
             Ok(Err(msg)) => {
-                let _ = capture.join();
+                let _ = coordinator.join();
                 return Err(msg.into());
             }
             Err(_) => {
-                let _ = capture.join();
-                return Err("WASAPI capture thread died during initialisation".into());
+                let _ = coordinator.join();
+                return Err("WASAPI coordinator thread died during initialisation".into());
             }
-        };
+        }
 
-        // 2. Consumer worker, identical wiring to the macOS tap and the mic recorder.
         let level_cb = self.level_cb.clone();
         let chunk_sink = self.chunk_sink.clone();
         let worker = std::thread::spawn({
             let stop_flag = stop_flag.clone();
             move || {
                 run_consumer(
-                    sample_rate,
+                    MIX_RATE,
                     FrameSinks::new(None, None, chunk_sink),
                     sample_rx,
                     cmd_rx,
@@ -308,7 +362,7 @@ impl SystemAudioRecorder {
 
         self.cmd_tx = Some(cmd_tx);
         self.worker_handle = Some(worker);
-        self.capture_handle = Some(capture);
+        self.coordinator_handle = Some(coordinator);
         Ok(())
     }
 
@@ -324,9 +378,9 @@ impl SystemAudioRecorder {
     }
 
     /// Same handshake as the cpal and CoreAudio paths: `Cmd::Stop` raises the shared stop flag,
-    /// the capture thread sees it and injects `EndOfStream` once, and `run_consumer`'s drain
-    /// loop breaks on the sentinel and replies with the drained samples (an empty Vec when a
-    /// chunk sink took them, exactly like macOS).
+    /// the coordinator sees it and injects `EndOfStream` once, and `run_consumer`'s drain loop
+    /// breaks on the sentinel and replies with the drained samples (an empty Vec when a chunk
+    /// sink took them, exactly like macOS).
     pub fn stop(&self) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
         let (resp_tx, resp_rx) = mpsc::channel();
         if let Some(tx) = &self.cmd_tx {
@@ -335,8 +389,7 @@ impl SystemAudioRecorder {
         Ok(resp_rx.recv_timeout(super::recorder::STOP_REPLY_TIMEOUT)?)
     }
 
-    /// Stop the stream, release every COM object (on the capture thread), join both threads.
-    /// Safe to call twice and from `Drop`.
+    /// Tear down every capture thread and the consumer. Safe to call twice and from `Drop`.
     pub fn close(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         if let Some(tx) = self.cmd_tx.take() {
             let _ = tx.send(Cmd::Shutdown);
@@ -344,9 +397,9 @@ impl SystemAudioRecorder {
         self.stop_flag.store(true, Ordering::Relaxed);
         self.quit.store(true, Ordering::Relaxed);
 
-        // The capture thread owns sample_tx; joining it first closes the channel so the
-        // consumer cannot block on a producer that is gone.
-        if let Some(h) = self.capture_handle.take() {
+        // The coordinator owns sample_tx; joining it first closes the channel so the consumer
+        // cannot block on a producer that is gone.
+        if let Some(h) = self.coordinator_handle.take() {
             let _ = h.join();
         }
         if let Some(h) = self.worker_handle.take() {
@@ -363,10 +416,258 @@ impl Drop for SystemAudioRecorder {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Capture thread
+// Coordinator: endpoint discovery + mixing
 // ---------------------------------------------------------------------------------------------
 
-/// Everything the capture loop needs, created on and never leaving the capture thread.
+/// One active render endpoint as the enumerator reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EndpointInfo {
+    /// The MMDevice id string (stable for the device's lifetime; what `GetDevice` takes).
+    id: String,
+    /// Friendly name for the log ("Headset (WH-1000XM4 Hands-Free)"), or the id if unreadable.
+    name: String,
+}
+
+/// A running per-endpoint capture, as the coordinator sees it.
+struct EndpointWorker {
+    info: EndpointInfo,
+    rx: mpsc::Receiver<Vec<f32>>,
+    quit: Arc<AtomicBool>,
+    /// Set by the endpoint thread when its stream died (device invalidated, capture error).
+    dead: Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+    /// 16 kHz mono samples received and not yet mixed.
+    pending: VecDeque<f32>,
+}
+
+impl EndpointWorker {
+    fn spawn(info: EndpointInfo) -> Self {
+        let (tx, rx) = mpsc::channel::<Vec<f32>>();
+        let quit = Arc::new(AtomicBool::new(false));
+        let dead = Arc::new(AtomicBool::new(false));
+        let handle = std::thread::Builder::new()
+            .name(format!("plaudy-loopback:{}", info.name))
+            .spawn({
+                let info = info.clone();
+                let quit = quit.clone();
+                let dead = dead.clone();
+                move || endpoint_thread(info, tx, quit, dead)
+            })
+            .ok();
+        if handle.is_none() {
+            dead.store(true, Ordering::Relaxed);
+        }
+        EndpointWorker {
+            info,
+            rx,
+            quit,
+            dead,
+            handle,
+            pending: VecDeque::new(),
+        }
+    }
+
+    fn retire(mut self) {
+        self.quit.store(true, Ordering::Relaxed);
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+/// Body of the coordinator thread.
+fn coordinator_thread(
+    init_tx: mpsc::Sender<Result<(), String>>,
+    sample_tx: mpsc::Sender<AudioChunk>,
+    stop_flag: Arc<AtomicBool>,
+    quit: Arc<AtomicBool>,
+) {
+    // SAFETY: a fresh thread; MTA is the right apartment for an audio worker.
+    let com = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
+    if com.is_err() {
+        let _ = init_tx.send(Err(format!("CoInitializeEx failed: {com}")));
+        return;
+    }
+    let enumerator: IMMDeviceEnumerator =
+        match unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL) } {
+            Ok(e) => e,
+            Err(e) => {
+                let _ = init_tx.send(Err(format!(
+                    "CoCreateInstance(MMDeviceEnumerator) failed: {e}"
+                )));
+                unsafe { CoUninitialize() };
+                return;
+            }
+        };
+
+    let mut workers: Vec<EndpointWorker> = Vec::new();
+    let initial = unsafe { active_render_endpoints(&enumerator) };
+    if initial.is_empty() {
+        log::warn!("WASAPI loopback: no active render endpoint; the system track will be silent until one appears");
+    }
+    for info in initial {
+        log::info!("WASAPI loopback: capturing \"{}\"", info.name);
+        workers.push(EndpointWorker::spawn(info));
+    }
+    let _ = init_tx.send(Ok(()));
+
+    let rate = MIX_RATE as f64;
+    let max_backlog = (MAX_BACKLOG.as_secs_f64() * rate) as usize;
+    let max_tail = (2.0 * MIX_LATENCY.as_secs_f64() * rate) as usize;
+    let resync_after = (RESYNC_AFTER.as_secs_f64() * rate) as u64;
+    let mut started = Instant::now();
+    let mut emitted: u64 = 0;
+    let mut last_scan = Instant::now();
+    let mut eos_sent = false;
+
+    while !quit.load(Ordering::Relaxed) {
+        std::thread::sleep(TICK);
+
+        // Follow the device list: new endpoints start capturing, vanished or dead ones retire
+        // (a dead one that is still active is re-spawned here as if new, which re-opens it).
+        if last_scan.elapsed() >= RESCAN_EVERY {
+            last_scan = Instant::now();
+            let active = unsafe { active_render_endpoints(&enumerator) };
+            let mut keep: Vec<EndpointWorker> = Vec::with_capacity(workers.len());
+            for w in workers.drain(..) {
+                let still_active = active.iter().any(|a| a.id == w.info.id);
+                if still_active && !w.dead.load(Ordering::Relaxed) {
+                    keep.push(w);
+                } else {
+                    log::info!(
+                        "WASAPI loopback: retiring \"{}\" ({})",
+                        w.info.name,
+                        if still_active { "stream died" } else { "endpoint gone" }
+                    );
+                    w.retire();
+                }
+            }
+            for info in active {
+                if !keep.iter().any(|w| w.info.id == info.id) {
+                    log::info!("WASAPI loopback: capturing \"{}\" (new endpoint)", info.name);
+                    keep.push(EndpointWorker::spawn(info));
+                }
+            }
+            workers = keep;
+        }
+
+        for w in &mut workers {
+            while let Ok(chunk) = w.rx.try_recv() {
+                w.pending.extend(chunk);
+            }
+        }
+
+        // Master clock, MIX_LATENCY behind wall time so every healthy endpoint has delivered.
+        let elapsed = started.elapsed().saturating_sub(MIX_LATENCY);
+        let expected = (elapsed.as_secs_f64() * rate) as u64;
+        let deficit = expected.saturating_sub(emitted);
+        if deficit >= resync_after {
+            log::warn!(
+                "WASAPI loopback: mixer {:.1} s behind wall clock (sleep/wake or starvation); re-basing",
+                deficit as f64 / rate
+            );
+            started = Instant::now();
+            emitted = 0;
+            for w in &mut workers {
+                w.pending.clear();
+            }
+            continue;
+        }
+        if deficit == 0 {
+            continue;
+        }
+
+        let mut queues: Vec<VecDeque<f32>> = workers
+            .iter_mut()
+            .map(|w| std::mem::take(&mut w.pending))
+            .collect();
+        let mixed = mix_next(&mut queues, deficit as usize, max_backlog);
+        for (w, q) in workers.iter_mut().zip(queues) {
+            w.pending = q;
+        }
+        emitted += deficit;
+
+        // Hand-off, mirroring the cpal callback (recorder.rs::build_stream) and the CoreAudio
+        // IOProc: while the consumer drains on Cmd::Stop, send EndOfStream exactly once and
+        // otherwise stay silent; frames mixed between a stop and the next start are dropped.
+        // On the stop edge this tick's chunk still belongs to the recording, and so does the
+        // tail the mixer is holding back (up to MIX_LATENCY of audio the endpoints have already
+        // delivered): flush both ahead of the sentinel so the track ends at the stop instant.
+        if stop_flag.load(Ordering::Relaxed) {
+            if !eos_sent {
+                let _ = sample_tx.send(AudioChunk::Samples(mixed));
+                let tail = workers
+                    .iter()
+                    .map(|w| w.pending.len())
+                    .max()
+                    .unwrap_or(0)
+                    .min(max_tail);
+                if tail > 0 {
+                    let mut queues: Vec<VecDeque<f32>> = workers
+                        .iter_mut()
+                        .map(|w| std::mem::take(&mut w.pending))
+                        .collect();
+                    let flushed = mix_next(&mut queues, tail, max_backlog);
+                    for (w, q) in workers.iter_mut().zip(queues) {
+                        w.pending = q;
+                    }
+                    emitted += tail as u64;
+                    let _ = sample_tx.send(AudioChunk::Samples(flushed));
+                }
+                let _ = sample_tx.send(AudioChunk::EndOfStream);
+                eos_sent = true;
+            }
+            continue;
+        }
+        eos_sent = false;
+        if sample_tx.send(AudioChunk::Samples(mixed)).is_err() {
+            break; // consumer gone (Shutdown raced us)
+        }
+    }
+
+    for w in workers.drain(..) {
+        w.retire();
+    }
+    drop(enumerator);
+    unsafe { CoUninitialize() };
+}
+
+/// Every render endpoint in the ACTIVE state, with its friendly name. Empty on any error.
+unsafe fn active_render_endpoints(enumerator: &IMMDeviceEnumerator) -> Vec<EndpointInfo> {
+    let Ok(collection) = enumerator.EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE) else {
+        return Vec::new();
+    };
+    let count = collection.GetCount().unwrap_or(0);
+    let mut out = Vec::with_capacity(count as usize);
+    for i in 0..count {
+        let Ok(device) = collection.Item(i) else {
+            continue;
+        };
+        let Ok(id_ptr) = device.GetId() else {
+            continue;
+        };
+        let id = id_ptr.to_string().unwrap_or_default();
+        CoTaskMemFree(Some(id_ptr.as_ptr() as *const _));
+        if id.is_empty() {
+            continue;
+        }
+        let name = device
+            .OpenPropertyStore(STGM_READ)
+            .and_then(|store| store.GetValue(&PKEY_Device_FriendlyName))
+            .map(|v| v.to_string())
+            .ok()
+            .filter(|n| !n.is_empty())
+            .unwrap_or_else(|| id.clone());
+        out.push(EndpointInfo { id, name });
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------------------------
+// Per-endpoint capture thread
+// ---------------------------------------------------------------------------------------------
+
+/// Everything one endpoint's capture loop needs, created on and never leaving its thread.
 struct Loopback {
     client: IAudioClient,
     capture: IAudioCaptureClient,
@@ -386,61 +687,62 @@ impl Drop for Loopback {
     }
 }
 
-/// Body of the capture thread. Initialises COM (MTA) and the loopback stream, reports the
-/// outcome through `init_tx`, then runs the capture loop until `quit`.
-fn capture_thread(
-    init_tx: mpsc::Sender<Result<u32, String>>,
-    sample_tx: mpsc::Sender<AudioChunk>,
-    stop_flag: Arc<AtomicBool>,
+/// Body of one endpoint's capture thread: open the loopback on that device, then run until
+/// `quit` or the stream dies (`dead` is raised so the coordinator retires and re-opens it).
+fn endpoint_thread(
+    info: EndpointInfo,
+    tx: mpsc::Sender<Vec<f32>>,
     quit: Arc<AtomicBool>,
+    dead: Arc<AtomicBool>,
 ) {
-    // SAFETY: a fresh thread; MTA is the right apartment for an audio worker and matches what
-    // cpal's WASAPI host uses in-process.
     let com = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
     if com.is_err() {
-        let _ = init_tx.send(Err(format!("CoInitializeEx failed: {com}")));
+        log::warn!("WASAPI loopback \"{}\": CoInitializeEx failed: {com}", info.name);
+        dead.store(true, Ordering::Relaxed);
         return;
     }
-
-    let loopback = match unsafe { open_loopback() } {
+    let result = unsafe { open_loopback(&info.id) };
+    let loopback = match result {
         Ok(l) => l,
         Err(e) => {
-            let _ = init_tx.send(Err(e));
+            log::warn!("WASAPI loopback \"{}\": {e}", info.name);
+            dead.store(true, Ordering::Relaxed);
             unsafe { CoUninitialize() };
             return;
         }
     };
     log::info!(
-        "WASAPI loopback open: {} Hz, {} ch, {:?}, block {} B",
+        "WASAPI loopback \"{}\": {} Hz, {} ch, {:?}, block {} B",
+        info.name,
         loopback.fmt.sample_rate,
         loopback.fmt.channels,
         loopback.fmt.format,
         loopback.fmt.block_align
     );
     if let Err(e) = unsafe { loopback.client.Start() } {
-        let _ = init_tx.send(Err(format!("IAudioClient::Start failed: {e}")));
+        log::warn!("WASAPI loopback \"{}\": IAudioClient::Start failed: {e}", info.name);
+        dead.store(true, Ordering::Relaxed);
         drop(loopback);
         unsafe { CoUninitialize() };
         return;
     }
-    // From here on the recorder is live; report success and run.
-    let _ = init_tx.send(Ok(loopback.fmt.sample_rate));
 
-    capture_loop(&loopback, &sample_tx, &stop_flag, &quit);
+    capture_loop(&info, &loopback, &tx, &quit, &dead);
 
     drop(loopback);
     unsafe { CoUninitialize() };
 }
 
-/// Activate the default render endpoint for shared-mode, event-driven loopback at its mix
-/// format. Every failure names the call that produced it.
-unsafe fn open_loopback() -> Result<Loopback, String> {
+/// Activate the endpoint `id` for shared-mode, event-driven loopback at its mix format.
+/// Every failure names the call that produced it.
+unsafe fn open_loopback(id: &str) -> Result<Loopback, String> {
     let enumerator: IMMDeviceEnumerator =
         CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)
             .map_err(|e| format!("CoCreateInstance(MMDeviceEnumerator) failed: {e}"))?;
+    let wide: Vec<u16> = id.encode_utf16().chain(std::iter::once(0)).collect();
     let device: IMMDevice = enumerator
-        .GetDefaultAudioEndpoint(eRender, eConsole)
-        .map_err(|e| format!("no default render endpoint (is any output device enabled?): {e}"))?;
+        .GetDevice(PCWSTR(wide.as_ptr()))
+        .map_err(|e| format!("IMMDeviceEnumerator::GetDevice failed: {e}"))?;
     let client: IAudioClient = device
         .Activate(CLSCTX_ALL, None)
         .map_err(|e| format!("IMMDevice::Activate(IAudioClient) failed: {e}"))?;
@@ -504,61 +806,57 @@ unsafe fn open_loopback() -> Result<Loopback, String> {
     })
 }
 
-/// The realtime-ish loop. Each iteration: wait for the event (bounded), drain every pending
+/// One endpoint's loop. Each iteration: wait for the event (bounded), drain every pending
 /// packet into `buf` (silent packets become zeros), top up with zeros if the clock says the
-/// renderer went quiet, then hand the chunk to the consumer under the same stop/EndOfStream
-/// contract as the cpal callback. A device loss is logged once and the loop keeps time with
-/// zeros until `quit`, so `stop()` still gets its reply and the WAV keeps its length.
+/// endpoint went quiet, resample to 16 kHz mono and send to the coordinator. Any capture error
+/// (device unplugged, format changed) ends the loop with `dead` raised; the coordinator pads
+/// zeros meanwhile and re-opens the endpoint if it is still active at the next scan.
 fn capture_loop(
+    info: &EndpointInfo,
     lb: &Loopback,
-    sample_tx: &mpsc::Sender<AudioChunk>,
-    stop_flag: &AtomicBool,
+    tx: &mpsc::Sender<Vec<f32>>,
     quit: &AtomicBool,
+    dead: &AtomicBool,
 ) {
     let rate = lb.fmt.sample_rate as u64;
-    let min_gap = MIN_GAP.as_secs_f64() * rate as f64;
-    let min_gap = min_gap as u64;
+    let min_gap = (MIN_GAP.as_secs_f64() * rate as f64) as u64;
     let resync_after = (RESYNC_AFTER.as_secs_f64() * rate as f64) as u64;
 
+    let mut resampler = FrameResampler::new(
+        lb.fmt.sample_rate as usize,
+        MIX_RATE as usize,
+        Duration::from_millis(30),
+    );
     let mut started = Instant::now();
     let mut emitted: u64 = 0;
-    let mut eos_sent = false;
-    let mut device_dead = false;
     let mut buf: Vec<f32> = Vec::new();
+    let mut out: Vec<f32> = Vec::new();
 
     while !quit.load(Ordering::Relaxed) {
-        if device_dead {
-            std::thread::sleep(EVENT_WAIT);
-        } else {
-            // SAFETY: `event` is a live auto-reset event owned by `lb`.
-            let _ = unsafe { WaitForSingleObject(lb.event, EVENT_WAIT.as_millis() as u32) };
-        }
+        // SAFETY: `event` is a live auto-reset event owned by `lb`.
+        let _ = unsafe { WaitForSingleObject(lb.event, TICK.as_millis() as u32) };
 
         buf.clear();
-        if !device_dead {
-            match unsafe { drain_packets(lb, &mut buf) } {
-                Ok(frames) => emitted += frames,
-                Err(e) if e.code() == AUDCLNT_E_DEVICE_INVALIDATED => {
-                    log::warn!(
-                        "WASAPI loopback: default render device invalidated (unplugged or \
-                         changed); keeping time with silence until the session stops"
-                    );
-                    device_dead = true;
-                }
-                Err(e) => {
-                    log::error!("WASAPI loopback: capture error {e}; switching to silence");
-                    device_dead = true;
-                }
+        match unsafe { drain_packets(lb, &mut buf) } {
+            Ok(frames) => emitted += frames,
+            Err(e) => {
+                log::warn!(
+                    "WASAPI loopback \"{}\": capture error {e}; stream retired (re-opened at the \
+                     next scan if the endpoint is still active)",
+                    info.name
+                );
+                dead.store(true, Ordering::Relaxed);
+                break;
             }
         }
 
-        // Clock discipline (R1).
+        // Clock discipline (R1), in device frames.
         let expected = (started.elapsed().as_secs_f64() * rate as f64) as u64;
         let deficit = expected.saturating_sub(emitted);
         if deficit >= resync_after {
             log::warn!(
-                "WASAPI loopback: {:.1} s behind wall clock (sleep/wake or starvation); re-basing \
-                 the clock instead of filling",
+                "WASAPI loopback \"{}\": {:.1} s behind wall clock; re-basing",
+                info.name,
                 deficit as f64 / rate as f64
             );
             started = Instant::now();
@@ -571,29 +869,20 @@ fn capture_loop(
             }
         }
 
-        // Hand-off, mirroring the cpal callback (recorder.rs::build_stream) and the CoreAudio
-        // IOProc: while the consumer drains on Cmd::Stop, send EndOfStream exactly once and
-        // otherwise stay silent; frames captured between a stop and the next start are dropped
-        // (nobody is recording them).
-        if stop_flag.load(Ordering::Relaxed) {
-            if !eos_sent {
-                let _ = sample_tx.send(AudioChunk::EndOfStream);
-                eos_sent = true;
-            }
+        if buf.is_empty() {
             continue;
         }
-        eos_sent = false;
-
-        if !buf.is_empty() && sample_tx.send(AudioChunk::Samples(std::mem::take(&mut buf))).is_err() {
-            // Consumer gone (Shutdown raced us): nothing left to feed.
-            break;
+        out.clear();
+        resampler.push(&buf, |frame: &[f32]| out.extend_from_slice(frame));
+        if !out.is_empty() && tx.send(std::mem::take(&mut out)).is_err() {
+            break; // coordinator gone
         }
     }
 }
 
-/// Pull every packet WASAPI has queued, appending mono f32 to `out`. Returns the number of
-/// frames taken (real or silent). A `SILENT` packet is zeros of the stated length: the stream
-/// position still advances, so the clock stays honest.
+/// Pull every packet WASAPI has queued, appending mono f32 at the device rate to `out`.
+/// Returns the number of frames taken (real or silent). A `SILENT` packet is zeros of the stated
+/// length: the stream position still advances, so the clock stays honest.
 unsafe fn drain_packets(lb: &Loopback, out: &mut Vec<f32>) -> windows::core::Result<u64> {
     let mut total: u64 = 0;
     loop {
@@ -843,11 +1132,52 @@ mod tests {
         assert!(inserted_zero_runs > 0, "the silent 30 s must have been zero-filled");
     }
 
-    // --- Live acceptance (manual: real WASAPI endpoint) --------------------------------------
+    // --- mix_next ---------------------------------------------------------------------------
+
+    fn q(v: &[f32]) -> VecDeque<f32> {
+        v.iter().copied().collect()
+    }
+
+    #[test]
+    fn mix_sums_endpoints_and_pads_the_short_one_with_silence() {
+        // Speakers carry 4 samples, the hands-free endpoint only 2 so far.
+        let mut queues = vec![q(&[0.1, 0.2, 0.3, 0.4]), q(&[0.5, 0.5])];
+        let out = mix_next(&mut queues, 4, 1_000);
+        assert_eq!(out, vec![0.6, 0.7, 0.3, 0.4]);
+        assert!(queues[0].is_empty() && queues[1].is_empty());
+    }
+
+    #[test]
+    fn mix_with_no_endpoints_is_silence_of_the_requested_length() {
+        let mut queues: Vec<VecDeque<f32>> = Vec::new();
+        assert_eq!(mix_next(&mut queues, 3, 10), vec![0.0; 3]);
+        let mut dead = vec![VecDeque::new()];
+        assert_eq!(mix_next(&mut dead, 2, 10), vec![0.0; 2]);
+    }
+
+    #[test]
+    fn mix_clamps_and_leaves_the_remainder_queued() {
+        let mut queues = vec![q(&[0.9, 0.9, 0.1]), q(&[0.9, -2.0, 0.1])];
+        let out = mix_next(&mut queues, 2, 1_000);
+        assert_eq!(out, vec![1.0, -1.0]);
+        assert_eq!(queues[0], q(&[0.1]));
+        assert_eq!(queues[1], q(&[0.1]));
+    }
+
+    #[test]
+    fn mix_trims_a_runaway_backlog_from_the_front() {
+        // An endpoint that raced ahead keeps only the newest `max_backlog` samples after the take.
+        let mut queues = vec![q(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0])];
+        let out = mix_next(&mut queues, 1, 2);
+        assert_eq!(out, vec![1.0]);
+        assert_eq!(queues[0], q(&[5.0, 6.0]));
+    }
+
+    // --- Live acceptance (manual: real WASAPI endpoints) ------------------------------------
     // Run: cargo test --lib system_audio -- --ignored --nocapture
 
-    /// Open the real default endpoint for 3 s and check the consumer returns ~3 s of 16 kHz
-    /// audio whether or not anything is playing (silence is zero-filled by the clock).
+    /// Open every active endpoint for 3 s and check the consumer returns ~3 s of 16 kHz audio
+    /// whether or not anything is playing (silence is zero-filled by the clocks).
     #[test]
     #[ignore = "manual: needs a live render endpoint"]
     fn live_three_seconds_have_three_seconds_of_frames() {
@@ -862,11 +1192,11 @@ mod tests {
         assert!((secs - 3.0).abs() < 0.3, "expected ~3 s, got {secs:.3} s");
     }
 
-    /// Self-contained signal check: record 9 s of loopback while PowerShell plays a Windows
-    /// ring tone through the default endpoint during seconds 3..6. The played window must be
-    /// clearly louder than the leading silence, proving the frames are the endpoint's audio and
-    /// not just clock-filled zeros. Set `PLAUDY_LOOPBACK_WAV=<path>` to also dump the 16 kHz
-    /// mono capture as a WAV for listening. Needs the endpoint unmuted.
+    /// Self-contained signal check: record ~12 s while PowerShell plays a Windows ring tone
+    /// through the default endpoint during seconds 3..6. The played window must carry signal,
+    /// and must be clearly louder than the leading window when that one was really quiet (the
+    /// user may already be playing something). Set `PLAUDY_LOOPBACK_WAV=<path>` to dump the
+    /// 16 kHz mono capture as a WAV for listening. Needs the endpoint unmuted.
     #[test]
     #[ignore = "manual: needs a live, unmuted render endpoint and plays a sound"]
     fn live_played_sound_is_louder_than_silence() {
@@ -911,9 +1241,6 @@ mod tests {
             w.finalize().unwrap();
             eprintln!("wrote {path}");
         }
-        // The endpoint's own output is what we capture, so anything else the user is playing
-        // (music, a call) is in the "quiet" window too. The ratio check therefore only applies
-        // when that window really was quiet; the absolute floor always does.
         assert!(loud > 0.005, "played window carries no signal: loud={loud}");
         if quiet < 0.002 {
             assert!(loud > quiet * 5.0, "played window must be audibly louder: quiet={quiet} loud={loud}");
