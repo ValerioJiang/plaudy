@@ -295,7 +295,6 @@ impl DiarizationManager {
     /// CPU-pegged silent hang). Windowing bounds both; the engine is built ONCE and reused across
     /// windows (a fresh `create()` reloads both ONNX models). Shorter tracks keep the whole-track
     /// path unchanged.
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     pub fn diarize(&self, samples: &[f32]) -> Vec<SpeakerTurn> {
         if !self.is_available() {
             return Vec::new();
@@ -313,7 +312,6 @@ impl DiarizationManager {
     /// Returns no turns on any failure, so [`align`] degrades to "unknown speaker" rather than
     /// the finalize failing: a recording with an unattributed transcript is still useful, a lost
     /// recording is not.
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn diarize_sortformer(&self, samples: &[f32]) -> Vec<SpeakerTurn> {
         use transcribe_cpp::{
             Diarize, Model, RunExtension, RunOptions, SortformerPreset, SortformerStreamOptions,
@@ -364,6 +362,8 @@ impl DiarizationManager {
         turns
     }
 
+    /// Only built where `sherpa-onnx` is a dependency (Apple-silicon macOS, see `Cargo.toml`).
+    /// Elsewhere the stub below answers "no turns" so the fallback arms above stay honest.
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn diarize_sherpa(&self, samples: &[f32]) -> Vec<SpeakerTurn> {
         use sherpa_onnx::{OfflineSpeakerDiarization, OfflineSpeakerDiarizationConfig};
@@ -439,10 +439,14 @@ impl DiarizationManager {
         cap_speakers(stitch_windows(diar_windows), diar_max_speakers())
     }
 
-    /// Non-macOS-aarch64 stub: diarization engine not built for this target (mirrors how the
-    /// CoreAudio system-audio recorder is gated).
+    /// Targets without the sherpa-onnx dependency (DIAR-W01): Sortformer is the only engine.
+    /// Reached when the checkpoint is missing or fails, or when `HANDY_DIAR_ENGINE=sherpa` is
+    /// forced; says so once and returns no turns, so [`align`] degrades to "unknown speaker".
     #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-    pub fn diarize(&self, _samples: &[f32]) -> Vec<SpeakerTurn> {
+    fn diarize_sherpa(&self, _samples: &[f32]) -> Vec<SpeakerTurn> {
+        log::warn!(
+            "diarization: the sherpa engine is not built on this platform (Sortformer only,              4-speaker ceiling); no speaker turns"
+        );
         Vec::new()
     }
 }
@@ -1325,10 +1329,28 @@ mod tests {
     //
     // Set HANDY_AB_ENGINE=sortformer|sherpa to run only one side (sherpa is ~10x slower, so a
     // sweep over several files usually wants sortformer alone).
+    /// Dynamic-backend builds (Windows, Linux) load the ggml modules at runtime; the app does it
+    /// once at startup (`TranscriptionManager`), a bare test binary must do it itself. The
+    /// modules sit next to the app binary (`target/<profile>/`), one level above the test exe
+    /// in `deps/`. Static builds (macOS Metal) make this a no-op. `HANDY_BACKENDS_DIR` overrides.
+    fn ensure_backends() {
+        let dir = std::env::var_os("HANDY_BACKENDS_DIR")
+            .map(std::path::PathBuf::from)
+            .or_else(|| {
+                std::env::current_exe()
+                    .ok()
+                    .and_then(|e| e.parent().and_then(|d| d.parent()).map(|p| p.to_path_buf()))
+            })
+            .expect("backend dir");
+        if let Err(e) = transcribe_cpp::init_backends(&dir) {
+            eprintln!("[test] init_backends({}) failed: {e}", dir.display());
+        }
+    }
+
     #[test]
     #[ignore = "A/B bench; needs a WAV + both engines' models via env"]
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn diarizer_ab() {
+        ensure_backends();
         let wav = std::env::var("HANDY_AB_WAV").expect("HANDY_AB_WAV");
         let truth: Option<usize> = std::env::var("HANDY_AB_TRUTH")
             .ok()
@@ -1432,8 +1454,8 @@ mod tests {
     // Add HANDY_REDIARIZE_WRITE=1 to persist the re-attribution (back up history.db first).
     #[test]
     #[ignore = "one-shot recovery; needs real WAV + DB + models via env"]
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     fn rediarize_recording() {
+        ensure_backends();
         let wav = std::env::var("HANDY_REDIAR_WAV").expect("HANDY_REDIAR_WAV");
         let db = std::env::var("HANDY_REDIAR_DB").expect("HANDY_REDIAR_DB");
         let models = std::env::var("HANDY_REDIAR_MODELS").expect("HANDY_REDIAR_MODELS");
