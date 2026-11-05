@@ -102,6 +102,15 @@ bun tauri build                           # … or build Plaudy.app + Plaudy_*.d
 
 > The current `.dmg` is **ad-hoc signed** (build-from-source or right-click → Open on first launch). A Developer-ID-signed & notarized release is on the roadmap. Full build notes: [handy/BUILD.md](handy/BUILD.md).
 
+**Windows 10/11.** One script installs the toolchain with winget, builds the app and adds a desktop shortcut:
+
+```powershell
+git clone https://github.com/ValerioJiang/plaudy; cd plaudy
+powershell -ExecutionPolicy Bypass -File scripts\setup-windows.ps1
+```
+
+Details, options and a ready-to-paste Claude Code prompt: **[docs/INSTALL-WINDOWS.md](docs/INSTALL-WINDOWS.md)**.
+
 ---
 
 ## Plaudy vs the cloud tools

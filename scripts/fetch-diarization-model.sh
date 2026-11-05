@@ -24,11 +24,24 @@ FILENAME="diar_streaming_sortformer_4spk-v2.1-Q8_0.gguf"
 SHA256="a5dacdc650790266c7a362e54e6bf51952015487edaa606c4e11632bc32442a9"
 BYTES=139310336
 
+# sha256 of a file. macOS ships `shasum`; Linux and Git Bash on Windows ship `sha256sum`
+# (Git Bash has `shasum` only in a login shell, under /usr/bin/core_perl).
+sha256_of() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | cut -d' ' -f1
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1" | cut -d' ' -f1
+  else
+    echo "error: neither sha256sum nor shasum is installed" >&2
+    return 1
+  fi
+}
+
 verify() {
-  local actual
-  actual="$(shasum -a 256 "$DEST" | cut -d' ' -f1)"
+  local file="${1:-$DEST}" actual
+  actual="$(sha256_of "$file")" || return 1
   [ "$actual" = "$SHA256" ] || {
-    echo "error: sha256 mismatch for $DEST" >&2
+    echo "error: sha256 mismatch for $file" >&2
     echo "  expected $SHA256" >&2
     echo "  actual   $actual" >&2
     return 1
@@ -52,6 +65,6 @@ curl --fail --location --progress-bar \
 
 # Only promote the file once it verifies, so an interrupted run never leaves a half model
 # that the app would try to load.
+verify "$TMP" || { rm -f "$TMP"; exit 1; }
 mv "$TMP" "$DEST"
-verify
 echo "ok: $DEST"
